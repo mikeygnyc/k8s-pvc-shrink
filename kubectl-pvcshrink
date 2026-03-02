@@ -33,18 +33,23 @@ check_deps() {
     fi
 }
 
+# Helper function to compare semantic versions
+# Returns 0 if $1 <= $2, 1 if $1 > $2
+version_gt() {
+    test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"
+}
+
 check_updates() {
     msg "Checking for updates..."
     local REMOTE_VERSION
-    # Fix SC2155: Separate declaration and assignment
     REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
 
-    # Basic sanitization to ensure we didn't get an HTML page
-    if [[ "$REMOTE_VERSION" == *"html"* ]] || [[ -z "$REMOTE_VERSION" ]]; then
-        REMOTE_VERSION="$VERSION"
-    fi
+    # Clean the 'v' prefix if present for comparison
+    local clean_remote="${REMOTE_VERSION#v}"
+    local clean_current="${VERSION#v}"
 
-    if [[ "$REMOTE_VERSION" != "$VERSION" ]]; then
+    # Only notify if the remote version is actually GREATER than current
+    if version_gt "$clean_remote" "$clean_current"; then
         highlight "✨ A new version ($REMOTE_VERSION) is available! (Current: $VERSION)"
         read -r -p "Update and restart now? (y/n): " UPDATE_NOW
         if [[ "$UPDATE_NOW" == "y" ]]; then
@@ -68,6 +73,7 @@ check_updates() {
         echo "------------------------------------------------"
     fi
 }
+
 
 rollback() {
     echo -e "\n"
