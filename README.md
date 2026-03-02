@@ -31,8 +31,17 @@ kubectl pvc-shrink
 ```
 
 ### Optional Flags:
+* `--version`: Check installed version.
 * `--no-check`: Skip the version check on startup.
 * `--dry-run`: Preview the `yq` YAML transformations without making any changes.
+
+## 🏗 Development & Releasing
+This project uses GitHub Actions to manage versions. To release a new version:
+1. Push your changes to `main`.
+2. Create and push a new git tag:
+   ```bash
+   git tag v1.x.x
+   git push origin --tags
 
 ## 🛡 License
 This project is licensed under the **MIT License**.
