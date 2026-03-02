@@ -1,29 +1,40 @@
 #!/bin/bash
 set -e
-# Pass "$@" so the function can see the original flags (Fixes SC2119/SC2120)
-if [[ "$*" != *"--no-check"* ]]; then
-    check_updates "$@"
-fi
-# --- Version & Update Config ---
-VERSION="v1.0.3"
+
+# --- 1. Constants & Functions (Defined First) ---
+VERSION="v1.0.0"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/kubectl-pvc-shrink"
-
-# --- Config ---
-TEMP_PVC_NAME="pvc-migration-temp"
+TEMP_PVC_NAME="pvc-shrink-temp"
 RSYNC_IMAGE="instrumentisto/rsync-ssh"
-LOG_DIR="./migration_logs"
-mkdir -p "$LOG_DIR"
+LOG_DIR="./shrink_logs"
 
-# --- UI Helpers ---
 msg() { echo -e "\e[32m[INFO]\e[0m $1"; }
 err() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 highlight() { echo -e "\e[33m$1\e[0m"; }
 
+# NEW: Pre-flight Dependency Check
+check_deps() {
+    local missing_deps=()
+    for dep in kubectl fzf yq column; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            missing_deps+=("$dep")
+        fi
+    done
+
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        echo -e "\e[31m[!] Missing Dependencies:\e[0m"
+        for item in "${missing_deps[@]}"; do
+            echo "  - $item"
+        done
+        echo -e "\nPlease install them using your package manager (e.g., brew install fzf yq)."
+        exit 1
+    fi
+}
+
 check_updates() {
     msg "Checking for updates..."
     local REMOTE_VERSION
-    # Fetch remote version
     REMOTE_VERSION=$(curl -s --connect-timeout 2 "$UPDATE_URL" || echo "$VERSION")
 
     if [[ "$REMOTE_VERSION" != "$VERSION" ]]; then
@@ -31,8 +42,8 @@ check_updates() {
         read -r -p "Update and restart now? (y/n): " UPDATE_NOW
         if [[ "$UPDATE_NOW" == "y" ]]; then
             local SCRIPT_PATH
-            SCRIPT_PATH=$(command -v kubectl-migrate || echo "$0")
-            local TEMP_FILE="/tmp/kubectl-migrate-update"
+            SCRIPT_PATH=$(command -v kubectl-pvc-shrink || echo "$0")
+            local TEMP_FILE="/tmp/kubectl-pvc-shrink-update"
 
             msg "Downloading update..."
             if curl -fsSL "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
@@ -42,7 +53,6 @@ check_updates() {
                     sudo mv "$TEMP_FILE" "$SCRIPT_PATH" && sudo chmod +x "$SCRIPT_PATH"
                 fi
                 msg "Update successful. Restarting..."
-                # Re-exec with the arguments passed into THIS function
                 exec "$SCRIPT_PATH" "$@"
             else
                 err "Update download failed."
@@ -52,65 +62,20 @@ check_updates() {
     fi
 }
 
-# --- Argument Parsing ---
-for arg in "$@"; do
-    case $arg in
-        --version|-v)
-            echo "kubectl-pvc-shrink version $VERSION"
-            exit 0
-            ;;
-        --help|-h)
-            echo "Usage: kubectl pvc-shrink [FLAGS]"
-            echo "Flags:"
-            echo "  --version, -v   Show current version"
-            echo "  --dry-run       Preview YAML changes without applying"
-            echo "  --no-check      Skip the update check on startup"
-            exit 0
-            ;;
-    esac
-done
-
-# --- Main Flow ---
-[[ "$*" != *"--no-check"* ]] && check_updates
-
-DRY_RUN=false
-[[ "$*" == *"--dry-run"* ]] && DRY_RUN=true
-
-TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
-[[ -z "$TYPE" ]] && exit 0
-
-SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE")
-[[ -z "$SELECTED_RES" ]] && exit 0
-
-NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
-RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
-
-PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
-[[ -z "$PVC_NAME" ]] && exit 0
-
-CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
-# Added -r to read (Fixes SC2162)
-read -r -p "Current size: $CURRENT_SIZE. Enter New Size: " NEW_SIZE
-
-if [ "$DRY_RUN" = true ]; then
-    kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\""
-    exit 0
-fi
-
-ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
-
 rollback() {
+    echo -e "\n"
     msg "Rolling back..."
     kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
-    kubectl delete pod migrate-to-temp migrate-back -n "$NAMESPACE" --ignore-not-found
+    kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found
     kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE" --ignore-not-found
     err "Rollback complete."
 }
 
 sync_and_verify() {
     local src_pvc=$1 dst_pvc=$2 job_name=$3 log_file
-    # Separate declaration and assignment (Fixes SC2155)
     log_file="$LOG_DIR/${job_name}_$(date +%Y%m%d_%H%M%S).log"
+    
+    msg "Syncing $src_pvc -> $dst_pvc..."
     
     cat <<EOF | kubectl apply -f -
 apiVersion: v1
@@ -148,13 +113,64 @@ EOF
     kubectl delete pod "$job_name" -n "$NAMESPACE"
 }
 
+# --- 2. Main Execution Entry Point ---
+
+# Check dependencies before doing anything else
+check_deps
+
+mkdir -p "$LOG_DIR"
+
+# Argument Parsing
+for arg in "$@"; do
+    case $arg in
+        --version|-v) echo "kubectl-pvc-shrink $VERSION"; exit 0 ;;
+        --help|-h) echo "Usage: kubectl pvc-shrink [--dry-run] [--no-check]"; exit 0 ;;
+    esac
+done
+
+# Run Update Check (Pass arguments to function)
+if [[ "$*" != *"--no-check"* ]]; then
+    check_updates "$@"
+fi
+
+DRY_RUN=false
+[[ "$*" == *"--dry-run"* ]] && DRY_RUN=true
+
+# Selection Menus
+TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
+[[ -z "$TYPE" ]] && exit 0
+
+SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE")
+[[ -z "$SELECTED_RES" ]] && exit 0
+
+NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
+RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
+
+PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
+[[ -z "$PVC_NAME" ]] && exit 0
+
+CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
+read -r -p "Current size: $CURRENT_SIZE. Enter New Size (e.g. 5Gi): " NEW_SIZE
+
+if [ "$DRY_RUN" = true ]; then
+    kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\""
+    exit 0
+fi
+
+ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
+
 trap rollback ERR
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
+
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq ".metadata.name = \"$TEMP_PVC_NAME\" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName)" | kubectl apply -f -
-sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "migrate-to-temp"
+
+sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "shrink-to-temp"
+
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\" | .metadata.annotations |= with_entries(select(.key == \"volume.autoscaler.kubernetes.io/ignore\"))" | kubectl replace --force -f -
-sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "migrate-back"
+
+sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "shrink-back"
+
 trap - ERR
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
 kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
-msg "Resize Successful!"
+msg "Shrink Successful!"
