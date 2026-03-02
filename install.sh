@@ -17,7 +17,7 @@ echo "🚀 Installing $TARGET to $BIN_DIR..."
 if [[ -f "./$TARGET" ]]; then
     cp "./$TARGET" "$BIN_DIR/$TARGET"
 else
-    curl -fsSL "$RAW_URL/$TARGET" -o "$BIN_DIR/$TARGET"
+    curl -fsSLH "Cache-Control: no-cache" "$RAW_URL/$TARGET" -o "$BIN_DIR/$TARGET"
 fi
 
 chmod +x "$BIN_DIR/$TARGET"

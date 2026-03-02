@@ -37,7 +37,7 @@ check_updates() {
     msg "Checking for updates..."
     local REMOTE_VERSION
     # Added -L to follow redirects and -sS to show errors but hide progress
-    REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
+    REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
 
     # Basic sanitization to ensure we didn't get an HTML page
     if [[ "$REMOTE_VERSION" == *"html"* ]] || [[ -z "$REMOTE_VERSION" ]]; then
@@ -54,7 +54,7 @@ check_updates() {
 
             msg "Downloading update..."
             # Added -L here as well
-            if curl -fL -sS "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
+            if curl -fL -sSH "Cache-Control: no-cache" "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
                 if [ -w "$SCRIPT_PATH" ]; then
                     mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
                 else
