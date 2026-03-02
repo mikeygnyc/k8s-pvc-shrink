@@ -3,7 +3,8 @@ set -e
 
 # --- Version & Update Config ---
 VERSION="v1.0.0"
-UPDATE_URL="https://raw.githubusercontent.com/USER/REPO/main/VERSION"
+UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/VERSION"
+RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/kubectl-migrate"
 
 # --- Config ---
 TEMP_PVC_NAME="pvc-migration-temp"
@@ -16,77 +17,95 @@ msg() { echo -e "\e[32m[INFO]\e[0m $1"; }
 err() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
 highlight() { echo -e "\e[33m$1\e[0m"; }
 
-notify() {
-    local title="Kube-PVC-Shrink"
-    local message=$1
-    if command -v notify-send >/dev/null; then
-        notify-send "$title" "$message"
-    elif command -v osascript >/dev/null; then
-        osascript -e "display notification \"$message\" with title \"$title\""
-    fi
-}
-
 check_updates() {
     msg "Checking for updates..."
+    local REMOTE_VERSION
     REMOTE_VERSION=$(curl -s --connect-timeout 2 "$UPDATE_URL" || echo "$VERSION")
+
     if [[ "$REMOTE_VERSION" != "$VERSION" ]]; then
-        highlight "✨ A new version ($REMOTE_VERSION) is available!"
-        echo "Update with: curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh | bash"
+        highlight "✨ A new version ($REMOTE_VERSION) is available! (Current: $VERSION)"
+        read -r -p "Update and restart now? (y/n): " UPDATE_NOW
+        if [[ "$UPDATE_NOW" == "y" ]]; then
+            local SCRIPT_PATH
+            SCRIPT_PATH=$(command -v kubectl-migrate || echo "$0")
+            local TEMP_FILE="/tmp/kubectl-migrate-update"
+
+            msg "Downloading update to $TEMP_FILE..."
+            if curl -fsSL "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
+                if [ -w "$SCRIPT_PATH" ]; then
+                    mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
+                else
+                    sudo mv "$TEMP_FILE" "$SCRIPT_PATH" && sudo chmod +x "$SCRIPT_PATH"
+                fi
+                msg "Update successful. Restarting..."
+                exec "$SCRIPT_PATH" "$@"
+            else
+                err "Update download failed."
+            fi
+        fi
         echo "------------------------------------------------"
     fi
 }
 
-# --- 1. Startup Logic ---
+# --- Argument Parsing ---
+for arg in "$@"; do
+    case $arg in
+        --version|-v)
+            echo "kubectl-migrate version $VERSION"
+            exit 0
+            ;;
+        --help|-h)
+            echo "Usage: kubectl migrate [FLAGS]"
+            echo "Flags:"
+            echo "  --version, -v   Show current version"
+            echo "  --dry-run       Preview YAML changes without applying"
+            echo "  --no-check      Skip the update check on startup"
+            exit 0
+            ;;
+    esac
+done
+
+# --- Main Flow ---
 [[ "$*" != *"--no-check"* ]] && check_updates
 
 DRY_RUN=false
 [[ "$*" == *"--dry-run"* ]] && DRY_RUN=true
 
-# --- 2. Selection Menus ---
 TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
 [[ -z "$TYPE" ]] && exit 0
 
-SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE to migrate")
+SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE")
 [[ -z "$SELECTED_RES" ]] && exit 0
 
 NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
 RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
 
-PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC to resize")
+PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
 [[ -z "$PVC_NAME" ]] && exit 0
 
 CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
-read -p "Current size: $CURRENT_SIZE. Enter New Size (e.g., 20Gi): " NEW_SIZE
+# Added -r to read (Fixes SC2162)
+read -r -p "Current size: $CURRENT_SIZE. Enter New Size: " NEW_SIZE
 
-# --- 3. Dry Run Preview ---
 if [ "$DRY_RUN" = true ]; then
-    echo -e "\n--- [DRY RUN] YAML PREVIEW ---"
-    kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "
-      del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) |
-      .spec.resources.requests.storage = \"$NEW_SIZE\" |
-      .metadata.annotations |= with_entries(select(.key == \"volume.autoscaler.kubernetes.io/ignore\"))
-    "
+    kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\""
     exit 0
 fi
 
-# --- 4. Rollback Logic ---
 ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
 
 rollback() {
-    echo -e "\n\e[31m[!] CRITICAL FAILURE\e[0m"
-    notify "Migration Failed! Rolling back..."
+    msg "Rolling back..."
     kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
     kubectl delete pod migrate-to-temp migrate-back -n "$NAMESPACE" --ignore-not-found
     kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE" --ignore-not-found
-    err "Rollback complete. Original state restored."
+    err "Rollback complete."
 }
 
-# --- 5. Sync & Table Verification ---
 sync_and_verify() {
-    local src_pvc=$1; local dst_pvc=$2; local job_name=$3
-    local log_file="$LOG_DIR/${job_name}_$(date +%Y%m%d_%H%M%S).log"
-    
-    msg "Syncing $src_pvc -> $dst_pvc..."
+    local src_pvc=$1 dst_pvc=$2 job_name=$3 log_file
+    # Separate declaration and assignment (Fixes SC2155)
+    log_file="$LOG_DIR/${job_name}_$(date +%Y%m%d_%H%M%S).log"
     
     cat <<EOF | kubectl apply -f -
 apiVersion: v1
@@ -111,45 +130,26 @@ EOF
     kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=120s || rollback
     kubectl logs -f "$job_name" -n "$NAMESPACE" | tee "$log_file"
 
+    local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT
     SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src | awk '{print $1}')
     DST_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /dst | awk '{print $1}')
     SRC_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /src | wc -l")
     DST_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /dst | wc -l")
 
-    REPORT=$(echo -e "METRIC\tSOURCE\tDEST\tMATCH\nSize\t$SRC_SIZE\t$DST_SIZE\t$([[ "$SRC_SIZE" == "$DST_SIZE" ]] && echo "✅" || echo "❌")\nFiles\t$SRC_COUNT\t$DST_COUNT\t$([[ "$SRC_COUNT" == "$DST_COUNT" ]] && echo "✅" || echo "❌")")
-    
-    echo -e "\n\e[1m--- DATA VERIFICATION ---\e[0m"
-    echo "$REPORT" | column -t -s $'\t'
-    echo -e "-------------------------\n"
+    echo -e "METRIC\tSOURCE\tDEST\tMATCH\nSize\t$SRC_SIZE\t$DST_SIZE\t$([[ "$SRC_SIZE" == "$DST_SIZE" ]] && echo "✅" || echo "❌")\nFiles\t$SRC_COUNT\t$DST_COUNT\t$([[ "$SRC_COUNT" == "$DST_COUNT" ]] && echo "✅" || echo "❌")" | column -t -s $'\t'
 
-    read -p "Data looks correct? Proceed? (y/n): " CONFIRM
-    if [[ $CONFIRM != "y" ]]; then rollback; fi
+    read -r -p "Proceed? (y/n): " CONFIRM
+    [[ $CONFIRM != "y" ]] && rollback
     kubectl delete pod "$job_name" -n "$NAMESPACE"
 }
 
-# --- 6. Execution ---
 trap rollback ERR
-msg "Scaling down $RES_NAME..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
-
-kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "
-  .metadata.name = \"$TEMP_PVC_NAME\" |
-  del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName)
-" | kubectl apply -f -
-
+kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq ".metadata.name = \"$TEMP_PVC_NAME\" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName)" | kubectl apply -f -
 sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "migrate-to-temp"
-
-msg "Recreating original PVC..."
-kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "
-  del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) |
-  .spec.resources.requests.storage = \"$NEW_SIZE\" |
-  .metadata.annotations |= with_entries(select(.key == \"volume.autoscaler.kubernetes.io/ignore\"))
-" | kubectl replace --force -f -
-
+kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\" | .metadata.annotations |= with_entries(select(.key == \"volume.autoscaler.kubernetes.io/ignore\"))" | kubectl replace --force -f -
 sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "migrate-back"
-
 trap - ERR
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
 kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
-notify "Resize successful!"
-msg "Complete. Logs in $LOG_DIR"
+msg "Resize Successful!"
