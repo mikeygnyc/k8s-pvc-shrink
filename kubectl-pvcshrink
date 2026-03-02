@@ -171,8 +171,23 @@ trap rollback ERR
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
 
 # 1. Create Staging PVC
-kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq ".metadata.name = \"$TEMP_PVC_NAME\" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName)" | kubectl apply -f -
+# 1. Create Staging PVC with a "Deep Clean" of metadata
+msg "Creating staging PVC..."
+kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '
+  .metadata.name = "'"$TEMP_PVC_NAME"'" | 
+  del(
+    .status, 
+    .metadata.uid, 
+    .metadata.resourceVersion, 
+    .metadata.creationTimestamp, 
+    .metadata.annotations["pv.kubernetes.io/bind-completed"],
+    .metadata.annotations["pv.kubernetes.io/bound-by-controller"],
+    .spec.volumeName
+  )' | kubectl apply -f -
 
+# Wait for bind
+msg "Waiting for $TEMP_PVC_NAME to bind..."
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$TEMP_PVC_NAME" -n "$NAMESPACE" --timeout=120s || rollback
 # --- NEW: Wait for PVC to bind ---
 msg "Waiting for $TEMP_PVC_NAME to bind..."
 kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$TEMP_PVC_NAME" -n "$NAMESPACE" --timeout=120s || rollback
