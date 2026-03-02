@@ -83,8 +83,11 @@ sync_and_verify() {
     local src_pvc=$1 dst_pvc=$2 job_name=$3 log_file
     log_file="$LOG_DIR/${job_name}_$(date +%Y%m%d_%H%M%S).log"
     
+    local start_time=$(date +%s)
     msg "Syncing $src_pvc -> $dst_pvc..."
     
+    # Create the Sync Pod
+    # Added --inplace for CSI stability and --info=progress2 for clean output
     cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
@@ -95,7 +98,7 @@ spec:
   containers:
   - name: rsync
     image: $RSYNC_IMAGE
-    command: ["sh", "-c", "rsync -avh --no-perms --no-owner --no-group --info=progress2 /src/ /dst/"]
+    command: ["sh", "-c", "rsync -avh --inplace --no-perms --no-owner --no-group --info=progress2 /src/ /dst/ && echo 'Sync Complete' && tail -f /dev/null"]
     volumeMounts: [{name: src, mountPath: /src}, {name: dst, mountPath: /dst}]
   restartPolicy: Never
   volumes:
@@ -105,20 +108,44 @@ spec:
     persistentVolumeClaim: {claimName: $dst_pvc}
 EOF
 
+    # Wait for Pod to be ready
     kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=120s || rollback
-    kubectl logs -f "$job_name" -n "$NAMESPACE" | tee "$log_file"
+    
+    # Stream logs with overwrite logic
+    # We use stdbuf to ensure the progress bar updates in real-time
+    msg "Progress:"
+    kubectl logs -f "$job_name" -n "$NAMESPACE" | \
+        stdbuf -oL tr '\r' '\n' | \
+        sed '/Sync Complete/q' | \
+        stdbuf -oL tr '\n' '\r'
+    
+    echo -e "\n" # Move to a new line after the progress bar finishes
+    
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
 
+    msg "Verifying data integrity..."
     local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT
+    
+    # Verification (Container is kept alive by tail -f /dev/null)
     SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src | awk '{print $1}')
     DST_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /dst | awk '{print $1}')
     SRC_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /src | wc -l")
     DST_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /dst | wc -l")
 
-    echo -e "METRIC\tSOURCE\tDEST\tMATCH\nSize\t$SRC_SIZE\t$DST_SIZE\t$([[ "$SRC_SIZE" == "$DST_SIZE" ]] && echo "✅" || echo "❌")\nFiles\t$SRC_COUNT\t$DST_COUNT\t$([[ "$SRC_COUNT" == "$DST_COUNT" ]] && echo "✅" || echo "❌")" | column -t -s $'\t'
+    # Final Summary Table
+    echo -e "\n--- Sync Summary ---"
+    echo -e "Duration:\t${duration} seconds"
+    echo -e "METRIC\tSOURCE\tDEST\tMATCH"
+    echo -e "Size\t$SRC_SIZE\t$DST_SIZE\t$([[ "$SRC_SIZE" == "$DST_SIZE" ]] && echo "✅" || echo "❌")"
+    echo -e "Files\t$SRC_COUNT\t$DST_COUNT\t$([[ "$SRC_COUNT" == "$DST_COUNT" ]] && echo "✅" || echo "❌")" | column -t -s $'\t'
+    echo -e "--------------------\n"
 
-    read -r -p "Proceed? (y/n): " CONFIRM
+    read -r -p "Proceed with migration? (y/n): " CONFIRM
     [[ $CONFIRM != "y" ]] && rollback
-    kubectl delete pod "$job_name" -n "$NAMESPACE"
+    
+    # Cleanup the sync pod immediately
+    kubectl delete pod "$job_name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1
 }
 
 # --- 2. Main Execution Entry Point ---
