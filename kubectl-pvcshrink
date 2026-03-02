@@ -89,8 +89,8 @@ sync_and_verify() {
     start_time=$(date +%s)
     msg "Syncing $src_pvc -> $dst_pvc..."
     
-    # Create the Sync Pod
-    cat <<EOF | kubectl apply -f -
+    # Using 'replace --force' with '-' reads from stdin and recreates the pod if it exists
+    cat <<EOF | kubectl replace --force -f -
 apiVersion: v1
 kind: Pod
 metadata:
@@ -113,9 +113,8 @@ EOF
     # Wait for Pod to be ready
     kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=120s || rollback
     
-    # Stream logs with overwrite logic
+    # Stream logs
     msg "Progress:"
-    # Use tee to satisfy SC2034 and actually log the output
     kubectl logs -f "$job_name" -n "$NAMESPACE" | \
         stdbuf -oL tr '\r' '\n' | \
         tee "$log_file" | \
@@ -132,14 +131,11 @@ EOF
     msg "Verifying data integrity..."
     local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT
     
-    # Verification (Container is kept alive by tail -f /dev/null)
-    # Fix SC2155: Separated declaration and assignment
     SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src | awk '{print $1}')
     DST_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /dst | awk '{print $1}')
     SRC_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /src | wc -l")
     DST_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /dst | wc -l")
 
-    # Final Summary Table
     echo -e "\n--- Sync Summary ---"
     echo -e "Duration:\t${duration} seconds"
     echo -e "METRIC\tSOURCE\tDEST\tMATCH"
@@ -173,6 +169,7 @@ fi
 DRY_RUN=false
 [[ "$*" == *"--dry-run"* ]] && DRY_RUN=true
 
+# --- Resource Selection ---
 TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
 [[ -z "$TYPE" ]] && exit 0
 
@@ -181,6 +178,10 @@ SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.nam
 
 NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
 RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
+
+# Pre-flight cleanup: Ensure no previous pods exist in this namespace
+# This prevents the "Forbidden" error if you restart the script quickly
+kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
 
 PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
 [[ -z "$PVC_NAME" ]] && exit 0
