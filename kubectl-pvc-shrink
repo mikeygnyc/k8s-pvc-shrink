@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
-
+# Pass "$@" so the function can see the original flags (Fixes SC2119/SC2120)
+if [[ "$*" != *"--no-check"* ]]; then
+    check_updates "$@"
+fi
 # --- Version & Update Config ---
 VERSION="v1.0.2"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/VERSION"
@@ -20,6 +23,7 @@ highlight() { echo -e "\e[33m$1\e[0m"; }
 check_updates() {
     msg "Checking for updates..."
     local REMOTE_VERSION
+    # Fetch remote version
     REMOTE_VERSION=$(curl -s --connect-timeout 2 "$UPDATE_URL" || echo "$VERSION")
 
     if [[ "$REMOTE_VERSION" != "$VERSION" ]]; then
@@ -27,10 +31,10 @@ check_updates() {
         read -r -p "Update and restart now? (y/n): " UPDATE_NOW
         if [[ "$UPDATE_NOW" == "y" ]]; then
             local SCRIPT_PATH
-            SCRIPT_PATH=$(command -v kubectl-pvc-shrink || echo "$0")
-            local TEMP_FILE="/tmp/kubectl-pvc-shrink-update"
+            SCRIPT_PATH=$(command -v kubectl-migrate || echo "$0")
+            local TEMP_FILE="/tmp/kubectl-migrate-update"
 
-            msg "Downloading update to $TEMP_FILE..."
+            msg "Downloading update..."
             if curl -fsSL "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
                 if [ -w "$SCRIPT_PATH" ]; then
                     mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
@@ -38,6 +42,7 @@ check_updates() {
                     sudo mv "$TEMP_FILE" "$SCRIPT_PATH" && sudo chmod +x "$SCRIPT_PATH"
                 fi
                 msg "Update successful. Restarting..."
+                # Re-exec with the arguments passed into THIS function
                 exec "$SCRIPT_PATH" "$@"
             else
                 err "Update download failed."
