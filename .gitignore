@@ -1,0 +1,12 @@
+# Migration Audit Logs
+migration_logs/
+*.log
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.idea/
+.vscode/

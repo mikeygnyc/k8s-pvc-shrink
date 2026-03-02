@@ -1,0 +1,38 @@
+# Kube-PVC-Shrink 🚀
+
+A high-integrity CLI tool for shrinking Kubernetes Persistent Volume Claims (PVCs). This tool uses a "Double-Hop" copy staging method to ensure data safety. While this tool can be used to resize a PVC in either direction it is designed to shrink a PVC as generally enlarging a PVC can be done online.
+
+## ⚡️ Instant Installation
+Run this one-liner to automatically detect your PATH (Homebrew or /usr/local/bin) and install the latest version:
+
+```bash
+/bin/bash -c "$(curl -fsSL [https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/install.sh](https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/install.sh))"
+```
+
+## ✨ Key Features
+* **Interactive UI**: Uses `fzf` to let you visually pick your Deployment, StatefulSet, and PVC.
+* **Auto-Update Check**: Automatically checks GitHub for a newer version on startup.
+* **Safety Rollback**: If a data sync fails, the script automatically scales your resources back up to their original state.
+* **Data Verification**: Generates a side-by-side table comparing **File Count** and **Disk Usage (du)**.
+* **SMB Optimized**: Uses `rsync` flags that prevent permission/ownership errors.
+* **Audit Logging**: Detailed logs of every file moved are saved to `./migration_logs`.
+
+## 🛠 Prerequisites
+Ensure these are installed on your machine:
+* `kubectl` (Configured for your cluster)
+* `fzf` (Interactive filtering)
+* `yq` (YAML processing)
+* `column` (Standard on Linux/macOS)
+
+## 📖 Usage
+Once installed, simply run:
+```bash
+kubectl pvc-shrink
+```
+
+### Optional Flags:
+* `--no-check`: Skip the version check on startup.
+* `--dry-run`: Preview the `yq` YAML transformations without making any changes.
+
+## 🛡 License
+This project is licensed under the **MIT License**.
