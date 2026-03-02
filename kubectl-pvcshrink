@@ -95,7 +95,7 @@ sync_and_verify() {
     start_time=$(date +%s)
     msg "Syncing $src_pvc -> $dst_pvc..."
     
-    # Using 'replace --force' with '-' reads from stdin and recreates the pod if it exists
+    # Create/Replace Pod logic remains the same...
     cat <<EOF | kubectl replace --force -f -
 apiVersion: v1
 kind: Pod
@@ -116,25 +116,26 @@ spec:
     persistentVolumeClaim: {claimName: $dst_pvc}
 EOF
 
-    # Wait for Pod to be ready
     kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=120s || rollback
     
-    # Stream logs
     msg "Progress:"
-    kubectl logs -f "$job_name" -n "$NAMESPACE" | \
-        stdbuf -oL tr '\r' '\n' | \
-        tee "$log_file" | \
-        sed '/Sync Complete/q' | \
-        stdbuf -oL tr '\n' '\r'
+    # 1. Added --prefix=false to remove "Pod/rsync" junk from the line
+    # 2. Forced unbuffering on every segment of the pipe
+    # 3. Use 'stdbuf -i0 -o0 -e0' for total pass-through
+    kubectl logs -f "$job_name" -n "$NAMESPACE" --prefix=false | \
+        stdbuf -i0 -o0 -e0 tr '\r' '\n' | \
+        stdbuf -i0 -o0 -e0 tee "$log_file" | \
+        stdbuf -i0 -o0 -e0 sed '/Sync Complete/q' | \
+        stdbuf -i0 -o0 -e0 tr '\n' '\r'
     
     echo -e "\n"
     
-    local end_time
-    local duration
-    end_time=$(date +%s)
-    duration=$((end_time - start_time))
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
 
+    # Verification logic remains the same...
     msg "Verifying data integrity..."
+    # ...
     local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT
     
     SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src | awk '{print $1}')
@@ -152,8 +153,7 @@ EOF
     read -r -p "Proceed with migration? (y/n): " CONFIRM
     [[ $CONFIRM != "y" ]] && rollback
     
-    kubectl delete pod "$job_name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1
-}
+    kubectl delete pod "$job_name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1}
 
 # --- 2. Main Execution Entry Point ---
 
