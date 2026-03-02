@@ -37,7 +37,7 @@ check_updates() {
     msg "Checking for updates..."
     local REMOTE_VERSION
     # Added -L to follow redirects and -sS to show errors but hide progress
-    REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
+    REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
 
     # Basic sanitization to ensure we didn't get an HTML page
     if [[ "$REMOTE_VERSION" == *"html"* ]] || [[ -z "$REMOTE_VERSION" ]]; then
@@ -170,13 +170,28 @@ ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.s
 trap rollback ERR
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
 
+# 1. Create Staging PVC
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq ".metadata.name = \"$TEMP_PVC_NAME\" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName)" | kubectl apply -f -
 
+# --- NEW: Wait for PVC to bind ---
+msg "Waiting for $TEMP_PVC_NAME to bind..."
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$TEMP_PVC_NAME" -n "$NAMESPACE" --timeout=120s || rollback
+# -------------------------------------------------------------
+
+# 2. Sync Data to Staging
 sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "shrink-to-temp"
 
+# 3. Delete & Recreate original PVC with new size
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\" | .metadata.annotations |= with_entries(select(.key == \"volume.autoscaler.kubernetes.io/ignore\"))" | kubectl replace --force -f -
 
+# --- NEW: Wait for original PVC to re-bind ---
+msg "Waiting for $PVC_NAME to re-bind at new size..."
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$PVC_NAME" -n "$NAMESPACE" --timeout=120s || rollback
+# ---------------------------------------------
+
+# 4. Sync Data back to original
 sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "shrink-back"
+
 
 trap - ERR
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
