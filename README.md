@@ -27,7 +27,7 @@ Ensure these are installed on your machine:
 ## 📖 Usage
 Once installed, simply run:
 ```bash
-kubectl pvc-shrink
+kubectl pvcshrink
 ```
 
 ### Optional Flags:

@@ -22,4 +22,4 @@ fi
 
 chmod +x "$BIN_DIR/$TARGET"
 
-echo "✅ Installed! Run 'kubectl pvc-shrink' to start."
+echo "✅ Installed! Run 'kubectl pvcshrink' to start."

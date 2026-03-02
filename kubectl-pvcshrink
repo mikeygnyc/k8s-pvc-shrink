@@ -113,7 +113,7 @@ mkdir -p "$LOG_DIR"
 for arg in "$@"; do
     case $arg in
         --version|-v) echo "kubectl-pvcshrink $VERSION"; exit 0 ;;
-        --help|-h) echo "Usage: kubectl pvc-shrink [--dry-run] [--no-check]"; exit 0 ;;
+        --help|-h) echo "Usage: kubectl pvcshrink [--dry-run] [--no-check]"; exit 0 ;;
     esac
 done
 
