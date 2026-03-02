@@ -2,7 +2,7 @@
 set -e
 
 # --- Version & Update Config ---
-VERSION="v1.0.0"
+VERSION="v1.0.2"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/kubectl-pvc-shrink"
 
