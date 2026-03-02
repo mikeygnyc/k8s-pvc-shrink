@@ -4,38 +4,26 @@ set -e
 # --- 1. Constants & Functions (Defined First) ---
 VERSION="v1.1.2"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main//VERSION"
-RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main//kubectl-pvc-shrink"
+RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main//kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
 RSYNC_IMAGE="instrumentisto/rsync-ssh"
 LOG_DIR="./shrink_logs"
 
-msg() { echo -e "\e[32m[INFO]\e[0m $1"; }
-err() { echo -e "\e[31m[ERROR]\e[0m $1"; exit 1; }
-highlight() { echo -e "\e[33m$1\e[0m"; }
-
-# NEW: Pre-flight Dependency Check
-check_deps() {
-    local missing_deps=()
-    for dep in kubectl fzf yq column; do
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            missing_deps+=("$dep")
-        fi
-    done
-
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        echo -e "\e[31m[!] Missing Dependencies:\e[0m"
-        for item in "${missing_deps[@]}"; do
-            echo "  - $item"
-        done
-        echo -e "\nPlease install them using your package manager (e.g., brew install fzf yq)."
-        exit 1
-    fi
-}
+# Use \033 for better compatibility across different terminals/shells
+msg() { echo -e "\033[32m[INFO]\033[0m $1"; }
+err() { echo -e "\033[31m[ERROR]\033[0m $1"; exit 1; }
+highlight() { echo -e "\033[33m$1\033[0m"; }
 
 check_updates() {
     msg "Checking for updates..."
     local REMOTE_VERSION
-    REMOTE_VERSION=$(curl -s --connect-timeout 2 "$UPDATE_URL" || echo "$VERSION")
+    # Added -L to follow redirects and -sS to show errors but hide progress
+    REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
+
+    # Basic sanitization to ensure we didn't get an HTML page
+    if [[ "$REMOTE_VERSION" == *"html"* ]] || [[ -z "$REMOTE_VERSION" ]]; then
+        REMOTE_VERSION="$VERSION"
+    fi
 
     if [[ "$REMOTE_VERSION" != "$VERSION" ]]; then
         highlight "✨ A new version ($REMOTE_VERSION) is available! (Current: $VERSION)"
@@ -46,7 +34,8 @@ check_updates() {
             local TEMP_FILE="/tmp/kubectl-pvc-shrink-update"
 
             msg "Downloading update..."
-            if curl -fsSL "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
+            # Added -L here as well
+            if curl -fL -sS "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
                 if [ -w "$SCRIPT_PATH" ]; then
                     mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
                 else
@@ -123,7 +112,7 @@ mkdir -p "$LOG_DIR"
 # Argument Parsing
 for arg in "$@"; do
     case $arg in
-        --version|-v) echo "kubectl-pvc-shrink $VERSION"; exit 0 ;;
+        --version|-v) echo "kubectl-pvcshrink $VERSION"; exit 0 ;;
         --help|-h) echo "Usage: kubectl pvc-shrink [--dry-run] [--no-check]"; exit 0 ;;
     esac
 done

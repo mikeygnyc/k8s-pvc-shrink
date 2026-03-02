@@ -63,13 +63,13 @@ jobs:
           NEW_VER=${{ steps.tag_action.outputs.new_tag }}
           echo "$NEW_VER" > VERSION
           # Update internal variable in the renamed script
-          sed -i "s/^VERSION=\"v.*\"/VERSION=\"$NEW_VER\"/" kubectl-pvc-shrink
+          sed -i "s/^VERSION=\"v.*\"/VERSION=\"$NEW_VER\"/" kubectl-pvcshrink
 
       - name: Commit and Push Version Bump
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION kubectl-pvc-shrink
+          git add VERSION kubectl-pvcshrink
           git commit -m "chore: bump version to ${{ steps.tag_action.outputs.new_tag }} [skip ci]"
           git push origin main
 
@@ -79,5 +79,5 @@ jobs:
           tag_name: ${{ steps.tag_action.outputs.new_tag }}
           body: ${{ steps.tag_action.outputs.changelog }}
           files: |
-            kubectl-pvc-shrink
+            kubectl-pvcshrink
             install.sh

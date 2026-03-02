@@ -3,7 +3,7 @@ set -e
 
 REPO_USER="mikeygnyc"
 REPO_NAME="k8s-pvc-shrink"
-TARGET="kubectl-pvc-shrink"
+TARGET="kubectl-pvcshrink"
 RAW_URL="https://raw.githubusercontent.com/$REPO_USER/$REPO_NAME/main"
 
 if command -v brew >/dev/null 2>&1; then
