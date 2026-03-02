@@ -6,12 +6,12 @@ A high-integrity CLI tool for shrinking Kubernetes Persistent Volume Claims (PVC
 Run this one-liner to automatically detect your PATH (Homebrew or /usr/local/bin) and install the latest version:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/install.sh)"
+curl -fsSL https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/install.sh | bash"
 ```
 
 ## ✨ Key Features
 * **Interactive UI**: Uses `fzf` to let you visually pick your Deployment, StatefulSet, and PVC.
-* **Auto-Update Check**: Automatically checks GitHub for a newer version on startup.
+* **In-Place Updates**: Automatically detects and installs newer versions from GitHub, then restarts the session seamlessly.
 * **Safety Rollback**: If a data sync fails, the script automatically scales your resources back up to their original state.
 * **Data Verification**: Generates a side-by-side table comparing **File Count** and **Disk Usage (du)**.
 * **SMB Optimized**: Uses `rsync` flags that prevent permission/ownership errors.

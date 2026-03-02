@@ -1,0 +1,36 @@
+name: Update Version on Tag
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update Version Files
+        run: |
+          # Extract tag name (e.g., v1.0.1)
+          NEW_VER=${GITHUB_REF#refs/tags/}
+          echo "Updating to $NEW_VER"
+
+          # 1. Update the standalone VERSION file
+          echo "$NEW_VER" > VERSION
+
+          # 2. Update the VERSION variable inside the script
+          # Matches VERSION="vX.X.X" and replaces it
+          sed -i "s/^VERSION=\"v.*\"/VERSION=\"$NEW_VER\"/" kubectl-migrate
+
+      - name: Commit and Push Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION kubectl-migrate
+          git commit -m "chore: bump version to $NEW_VER [skip ci]"
+          git push origin main

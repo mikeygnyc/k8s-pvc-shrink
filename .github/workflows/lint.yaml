@@ -1,11 +1,40 @@
-name: Lint Script
-on: [push]
+name: CI Linting
+on: [push, pull_request]
+
 jobs:
   shellcheck:
+    name: ShellCheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@master
         with:
           scandir: '.'
+
+  yq-validation:
+    name: YQ Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate YQ Transformations
+        run: |
+          # Create a dummy PVC to test our yq logic
+          echo 'apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: test-pvc
+            annotations:
+              volume.autoscaler.kubernetes.io/ignore: "true"
+          spec:
+            resources:
+              requests:
+                storage: 1Gi' > test.yaml
+
+          # Test the "Staging PVC" transformation
+          cat test.yaml | yq ".metadata.name = \"temp\" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName)" > /dev/null
+          
+          # Test the "Resize" transformation
+          cat test.yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"10Gi\" | .metadata.annotations |= with_entries(select(.key == \"volume.autoscaler.kubernetes.io/ignore\"))" > /dev/null
+          
+          echo "✅ YQ transformation logic is valid."
