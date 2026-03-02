@@ -6,7 +6,7 @@ A high-integrity CLI tool for shrinking Kubernetes Persistent Volume Claims (PVC
 Run this one-liner to automatically detect your PATH (Homebrew or /usr/local/bin) and install the latest version:
 
 ```bash
-/bin/bash -c "$(curl -fsSL [https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/install.sh](https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/install.sh))"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/install.sh)"
 ```
 
 ## ✨ Key Features
