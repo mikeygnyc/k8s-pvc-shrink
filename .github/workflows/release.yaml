@@ -37,11 +37,12 @@ jobs:
           # Test the "Resize" transformation
           cat test.yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"10Gi\" | .metadata.annotations |= with_entries(select(.key == \"volume.autoscaler.kubernetes.io/ignore\"))" > /dev/null
           
-          echo "✅ YQ transformation logic is valid.
+          echo "✅ YQ transformation logic is valid."
+
   # 2. Release Job: Depends on 'test'
   bump-and-release:
     name: Bump & Release
-    needs: test  # <--- THIS IS THE MAGIC LINE
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write
