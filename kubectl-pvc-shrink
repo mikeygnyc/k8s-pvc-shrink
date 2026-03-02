@@ -2,7 +2,7 @@
 set -e
 
 # --- 1. Constants & Functions (Defined First) ---
-VERSION="v1.0.0"
+VERSION="v1.1.0"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/kubectl-pvc-shrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
