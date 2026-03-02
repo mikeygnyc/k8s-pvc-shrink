@@ -4,7 +4,7 @@ set -e
 # --- Version & Update Config ---
 VERSION="v1.0.0"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/VERSION"
-RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/kubectl-migrate"
+RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/main/kubectl-pvc-shrink"
 
 # --- Config ---
 TEMP_PVC_NAME="pvc-migration-temp"
@@ -27,8 +27,8 @@ check_updates() {
         read -r -p "Update and restart now? (y/n): " UPDATE_NOW
         if [[ "$UPDATE_NOW" == "y" ]]; then
             local SCRIPT_PATH
-            SCRIPT_PATH=$(command -v kubectl-migrate || echo "$0")
-            local TEMP_FILE="/tmp/kubectl-migrate-update"
+            SCRIPT_PATH=$(command -v kubectl-pvc-shrink || echo "$0")
+            local TEMP_FILE="/tmp/kubectl-pvc-shrink-update"
 
             msg "Downloading update to $TEMP_FILE..."
             if curl -fsSL "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
@@ -51,11 +51,11 @@ check_updates() {
 for arg in "$@"; do
     case $arg in
         --version|-v)
-            echo "kubectl-migrate version $VERSION"
+            echo "kubectl-pvc-shrink version $VERSION"
             exit 0
             ;;
         --help|-h)
-            echo "Usage: kubectl migrate [FLAGS]"
+            echo "Usage: kubectl pvc-shrink [FLAGS]"
             echo "Flags:"
             echo "  --version, -v   Show current version"
             echo "  --dry-run       Preview YAML changes without applying"
