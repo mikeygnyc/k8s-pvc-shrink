@@ -2,7 +2,7 @@
 set -e
 
 # --- 1. Constants & Functions ---
-VERSION="v1.1.17"
+VERSION="v1.1.18"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
@@ -33,7 +33,7 @@ check_deps() {
     fi
 }
 
-# Fix SC2120: Arguments are not passed to this function directly
+# Fix SC2120: Explicitly accepting arguments to pass to the exec call
 check_updates() {
     local REMOTE_VERSION
     REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
@@ -51,7 +51,7 @@ check_updates() {
             if curl -fL -sSH "Cache-Control: no-cache" "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
                 mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
                 msg "Update successful. Restarting..."
-                # We use the script's global arguments for the restart
+                # Re-exec with the arguments passed into THIS function
                 exec "$SCRIPT_PATH" "$@"
             fi
         fi
@@ -106,21 +106,19 @@ EOF
         rollback
     fi
 
-    local end_time
-    local duration
+    local end_time duration SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT size_match count_match
     end_time=$(date +%s)
     duration=$((end_time - start_time))
 
     msg "Verifying integrity..."
-    local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT
     SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src | awk '{print $1}')
     DST_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /dst | awk '{print $1}')
     SRC_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /src | wc -l")
     DST_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /dst | wc -l")
 
-    local size_match="❌"
+    size_match="❌"
     [[ "$SRC_SIZE" == "$DST_SIZE" ]] && size_match="✅"
-    local count_match="❌"
+    count_match="❌"
     [[ "$SRC_COUNT" == "$DST_COUNT" ]] && count_match="✅"
 
     echo -e "\n--- Sync Summary ---\nDuration: ${duration}s"
@@ -149,8 +147,8 @@ done
 
 if [[ "$SKIP_CHECK" = false ]]; then
     msg "Checking for updates..."
-    # Fix SC2119: Function is called without arguments correctly
-    check_updates
+    # Fix SC2119: Passing the script's arguments into the function
+    check_updates "$@"
 fi
 
 TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
