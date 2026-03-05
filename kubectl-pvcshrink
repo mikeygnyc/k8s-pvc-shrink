@@ -2,7 +2,7 @@
 set -e
 
 # --- 1. Constants & Functions ---
-VERSION="v1.1.16"
+VERSION="v1.1.27"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
@@ -206,12 +206,9 @@ if [[ -n "$ACTIVE_POD" ]]; then
     
     echo -e "Current: $CURRENT_SIZE | Usage: $SOURCE_HUMAN | Min Rec (+10%): $MIN_REC"
     
-    # Restored Loop: Reprompt if size is too small
     while true; do
         read -r -p "Enter New Size (e.g., 50 or 50Gi): " USER_INPUT
-        if [[ -z "$USER_INPUT" ]]; then
-            continue
-        fi
+        if [[ -z "$USER_INPUT" ]]; then continue; fi
         
         if [[ "$USER_INPUT" =~ ^[0-9.]+$ ]]; then
             NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}"
@@ -219,7 +216,6 @@ if [[ -n "$ACTIVE_POD" ]]; then
             NEW_SIZE="$USER_INPUT"
         fi
         
-        # Validation Logic
         CLEAN_NEW_SIZE=${NEW_SIZE//i/}
         NEW_SIZE_BYTES=$(numfmt --from=iec "$CLEAN_NEW_SIZE")
 
@@ -228,9 +224,7 @@ if [[ -n "$ACTIVE_POD" ]]; then
             continue
         elif [[ "$TEN_PERCENT_BUFFER" -gt "$NEW_SIZE_BYTES" ]]; then
             read -r -p "Warning: Less than 10% overhead. Continue? (y/n): " WC
-            if [[ "$WC" != "y" ]]; then 
-                continue 
-            fi
+            if [[ "$WC" != "y" ]]; then continue; fi
         fi
         break
     done
@@ -248,7 +242,8 @@ trap rollback ERR
 
 msg "Scaling down $TYPE/$RES_NAME..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
-kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=120s --ignore-not-found || true
+# FIXED: Removed --ignore-not-found from wait, using silent failure instead
+kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=120s || true
 
 msg "Creating staging PVC..."
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '.metadata.name = "'"$TEMP_PVC_NAME"'" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.annotations["pv.kubernetes.io/bind-completed"], .metadata.annotations["pv.kubernetes.io/bound-by-controller"], .spec.volumeName)' | kubectl apply -f -
@@ -269,7 +264,8 @@ kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
 kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE" --timeout=300s
 
 msg "Verifying Pod Readiness..."
-kubectl wait --for=condition=Ready pods -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=300s
+# FIXED: Removed --ignore-not-found from wait
+kubectl wait --for=condition=Ready pods -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=300s || true
 
 msg "Shrink Complete. Cleaning up temporary volume..."
 kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
