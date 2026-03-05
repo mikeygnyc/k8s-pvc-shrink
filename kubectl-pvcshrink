@@ -2,7 +2,7 @@
 set -e
 
 # --- 1. Constants & Functions ---
-VERSION="v1.1.17"
+VERSION="v1.1.29"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
@@ -118,20 +118,17 @@ EOF
     duration=$((end_time - start_time))
 
     msg "Verifying integrity..."
-    SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src | awk '{print $1}')
-    DST_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /dst | awk '{print $1}')
-    SRC_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /src | wc -l")
-    DST_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /dst | wc -l")
+    # Selective filtering: Keep stderr but filter out known WebSocket noise
+    SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src 2> >(grep -v "Unknown stream id" >&2) | awk '{print $1}')
+    DST_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /dst 2> >(grep -v "Unknown stream id" >&2) | awk '{print $1}')
+    SRC_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /src 2> >(grep -v 'Unknown stream id' >&2) | wc -l")
+    DST_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /dst 2> >(grep -v 'Unknown stream id' >&2) | wc -l")
 
     size_match="❌"
-    if [[ "$SRC_SIZE" == "$DST_SIZE" ]]; then
-        size_match="✅"
-    fi
+    [[ "$SRC_SIZE" == "$DST_SIZE" ]] && size_match="✅"
     
     count_match="❌"
-    if [[ "$SRC_COUNT" == "$DST_COUNT" ]]; then
-        count_match="✅"
-    fi
+    [[ "$SRC_COUNT" == "$DST_COUNT" ]] && count_match="✅"
 
     echo -e "\n--- Sync Summary ---\nDuration: ${duration}s"
     echo -e "METRIC\tSOURCE\tDEST\tMATCH\nSize\t$SRC_SIZE\t$DST_SIZE\t$size_match\nFiles\t$SRC_COUNT\t$DST_COUNT\t$count_match" | column -t -s $'\t'
@@ -156,28 +153,18 @@ DRY_RUN=false
 SKIP_CHECK=false
 for arg in "$@"; do
     case $arg in
-        --dry-run)
-            DRY_RUN=true
-            ;;
-        --no-check)
-            SKIP_CHECK=true
-            ;;
+        --dry-run) DRY_RUN=true ;;
+        --no-check) SKIP_CHECK=true ;;
     esac
 done
 
-if [[ "$SKIP_CHECK" = false ]]; then 
-    check_updates "$@"
-fi
+[[ "$SKIP_CHECK" = false ]] && check_updates "$@"
 
 TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
-if [[ -z "$TYPE" ]]; then
-    exit 0
-fi
+[[ -z "$TYPE" ]] && exit 0
 
 SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE")
-if [[ -z "$SELECTED_RES" ]]; then
-    exit 0
-fi
+[[ -z "$SELECTED_RES" ]] && exit 0
 
 NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
 RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
@@ -185,9 +172,7 @@ RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
 kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
 
 PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
-if [[ -z "$PVC_NAME" ]]; then
-    exit 0
-fi
+[[ -z "$PVC_NAME" ]] && exit 0
 
 CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
 CURRENT_UNIT=${CURRENT_SIZE//[0-9.]/}
@@ -196,8 +181,10 @@ ACTIVE_POD=$(kubectl get pods -n "$NAMESPACE" --field-selector=status.phase=Runn
 
 if [[ -n "$ACTIVE_POD" ]]; then
     MOUNT_NAME=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.volumes[?(@.persistentVolumeClaim.claimName=="'"$PVC_NAME"'")].name}')
-    MOUNT_PATH=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.containers[*].volumeMounts[?(@.name=="'"$MOUNT_NAME"'")].mountPath}')
-    
+    MOUNT_PATH=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.containers[*].volumeMounts[?(@.name=="'"$MOUNT_NAME"'")].name == "'"$MOUNT_NAME"'" ].mountPath}')
+    # Fallback if yq/jsonpath filtering is complex in certain environments
+    [[ -z "$MOUNT_PATH" ]] && MOUNT_PATH=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o json | yq -r ".spec.containers[].volumeMounts[] | select(.name == \"$MOUNT_NAME\") | .mountPath" | head -n 1)
+
     msg "Calculating usage on $MOUNT_PATH..."
     SOURCE_BYTES=$(kubectl exec -n "$NAMESPACE" "$ACTIVE_POD" -- du -sb "$MOUNT_PATH" | awk '{print $1}')
     SOURCE_HUMAN=$(numfmt --to=iec-i --suffix=B --format="%.2f" "$SOURCE_BYTES")
@@ -208,7 +195,7 @@ if [[ -n "$ACTIVE_POD" ]]; then
     
     while true; do
         read -r -p "Enter New Size (e.g., 50 or 50Gi): " USER_INPUT
-        if [[ -z "$USER_INPUT" ]]; then continue; fi
+        [[ -z "$USER_INPUT" ]] && continue
         
         if [[ "$USER_INPUT" =~ ^[0-9.]+$ ]]; then
             NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}"
@@ -224,7 +211,7 @@ if [[ -n "$ACTIVE_POD" ]]; then
             continue
         elif [[ "$TEN_PERCENT_BUFFER" -gt "$NEW_SIZE_BYTES" ]]; then
             read -r -p "Warning: Less than 10% overhead. Continue? (y/n): " WC
-            if [[ "$WC" != "y" ]]; then continue; fi
+            [[ "$WC" != "y" ]] && continue
         fi
         break
     done
@@ -242,7 +229,6 @@ trap rollback ERR
 
 msg "Scaling down $TYPE/$RES_NAME..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
-# FIXED: Removed --ignore-not-found from wait, using silent failure instead
 kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=120s || true
 
 msg "Creating staging PVC..."
@@ -264,8 +250,10 @@ kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
 kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE" --timeout=300s
 
 msg "Verifying Pod Readiness..."
-# FIXED: Removed --ignore-not-found from wait
-kubectl wait --for=condition=Ready pods -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=300s || true
+sleep 2
+# Improved readiness check using a more generic label match
+kubectl wait --for=condition=Ready pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$RES_NAME" --timeout=300s || \
+kubectl wait --for=condition=Ready pods -n "$NAMESPACE" -l "app=$RES_NAME" --timeout=300s || true
 
 msg "Shrink Complete. Cleaning up temporary volume..."
 kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
