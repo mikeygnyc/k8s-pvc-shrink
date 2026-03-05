@@ -2,16 +2,25 @@
 set -e
 
 # --- 1. Constants & Functions ---
-VERSION="v1.1.15"
+VERSION="v1.1.26"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
 RSYNC_IMAGE="instrumentisto/rsync-ssh"
 LOG_DIR="./shrink_logs"
 
-msg() { echo -e "\033[32m[INFO]\033[0m $1"; }
-err() { echo -e "\033[31m[ERROR]\033[0m $1"; exit 1; }
-highlight() { echo -e "\033[33m$1\033[0m"; }
+msg() {
+    echo -e "\033[32m[INFO]\033[0m $1"
+}
+
+err() {
+    echo -e "\033[31m[ERROR]\033[0m $1"
+    exit 1
+}
+
+highlight() {
+    echo -e "\033[33m$1\033[0m"
+}
 
 version_gt() {
     test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"
@@ -24,31 +33,32 @@ check_deps() {
             missing_deps+=("$dep")
         fi
     done
-
+    
     if [[ ${#missing_deps[@]} -ne 0 ]]; then
         echo -e "\033[31m[!] Missing Dependencies:\033[0m"
-        for item in "${missing_deps[@]}"; do echo "  - $item"; done
-        echo -e "\nPlease install them (e.g., brew install coreutils bc fzf yq)."
+        for item in "${missing_deps[@]}"; do
+            echo "  - $item"
+        done
         exit 1
     fi
 }
 
 check_updates() {
-    local REMOTE_VERSION
+    local REMOTE_VERSION clean_remote clean_current SCRIPT_PATH TEMP_FILE
     REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
-
-    local clean_remote="${REMOTE_VERSION#v}"
-    local clean_current="${VERSION#v}"
+    
+    clean_remote="${REMOTE_VERSION#v}"
+    clean_current="${VERSION#v}"
 
     if version_gt "$clean_remote" "$clean_current"; then
-        highlight "✨ A new version ($REMOTE_VERSION) is available! (Current: $VERSION)"
+        highlight "✨ A new version ($REMOTE_VERSION) is available!"
         read -r -p "Update and restart now? (y/n): " UPDATE_NOW
         if [[ "$UPDATE_NOW" == "y" ]]; then
-            local SCRIPT_PATH
             SCRIPT_PATH=$(command -v kubectl-pvcshrink || echo "$0")
-            local TEMP_FILE="/tmp/kubectl-pvcshrink-update"
+            TEMP_FILE="/tmp/pvcshrink-upd"
             if curl -fL -sSH "Cache-Control: no-cache" "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
-                mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
+                mv "$TEMP_FILE" "$SCRIPT_PATH"
+                chmod +x "$SCRIPT_PATH"
                 msg "Update successful. Restarting..."
                 exec "$SCRIPT_PATH" "$@"
             fi
@@ -58,20 +68,20 @@ check_updates() {
 
 rollback() {
     echo -e "\n"
-    msg "Rolling back..."
-    kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
-    kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found
-    kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE" --ignore-not-found
-    err "Rollback complete."
+    highlight "[CRITICAL] An error occurred. Attempting scale-up recovery..."
+    kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS" || true
+    msg "Workload scaled back. NOTE: '$TEMP_PVC_NAME' was NOT deleted to preserve data."
+    err "Manual intervention required. Check PVC '$PVC_NAME' vs '$TEMP_PVC_NAME'."
 }
 
 sync_and_verify() {
-    local src_pvc=$1 dst_pvc=$2 job_name=$3 log_file
+    local src_pvc=$1 dst_pvc=$2 job_name=$3 log_file start_time end_time duration
+    local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT size_match count_match CONFIRM
+    
     log_file="$LOG_DIR/${job_name}_$(date +%Y%m%d_%H%M%S).log"
-    local start_time
     start_time=$(date +%s)
     
-    msg "Preparing sync environment ($job_name)..."
+    msg "Preparing sync Pod ($job_name)..."
     cat <<EOF | kubectl replace --force -f -
 apiVersion: v1
 kind: Pod
@@ -96,15 +106,14 @@ spec:
     persistentVolumeClaim: {claimName: $dst_pvc}
 EOF
 
-    kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=60s >/dev/null
+    kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=120s >/dev/null
 
     msg "Syncing data (Live Progress):"
     if ! kubectl exec "$job_name" -n "$NAMESPACE" -- \
         rsync -avh --inplace --no-perms --no-owner --no-group --info=progress2 /src/ /dst/ | tee "$log_file"; then
-        rollback
+        highlight "⚠️ Rsync reported errors. Verify logs at $log_file"
     fi
 
-    local end_time duration SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT size_match count_match
     end_time=$(date +%s)
     duration=$((end_time - start_time))
 
@@ -115,15 +124,27 @@ EOF
     DST_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /dst | wc -l")
 
     size_match="❌"
-    [[ "$SRC_SIZE" == "$DST_SIZE" ]] && size_match="✅"
+    if [[ "$SRC_SIZE" == "$DST_SIZE" ]]; then
+        size_match="✅"
+    fi
+    
     count_match="❌"
-    [[ "$SRC_COUNT" == "$DST_COUNT" ]] && count_match="✅"
+    if [[ "$SRC_COUNT" == "$DST_COUNT" ]]; then
+        count_match="✅"
+    fi
 
     echo -e "\n--- Sync Summary ---\nDuration: ${duration}s"
     echo -e "METRIC\tSOURCE\tDEST\tMATCH\nSize\t$SRC_SIZE\t$DST_SIZE\t$size_match\nFiles\t$SRC_COUNT\t$DST_COUNT\t$count_match" | column -t -s $'\t'
     
-    read -r -p "Proceed? (y/n): " CONFIRM
-    [[ $CONFIRM != "y" ]] && rollback
+    if [[ "$size_match" == "❌" ]]; then
+        highlight "⚠️ WARNING: Data sizes do not match!"
+    fi
+    
+    read -r -p "Proceed to next step? (y/n): " CONFIRM
+    if [[ "$CONFIRM" != "y" ]]; then 
+        rollback
+    fi
+    
     kubectl delete pod "$job_name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1
 }
 
@@ -135,56 +156,62 @@ DRY_RUN=false
 SKIP_CHECK=false
 for arg in "$@"; do
     case $arg in
-        --version|-v) echo "kubectl-pvcshrink $VERSION"; exit 0 ;;
-        --help|-h) echo "Usage: kubectl pvcshrink [--dry-run] [--no-check]"; exit 0 ;;
-        --dry-run) DRY_RUN=true ;;
-        --no-check) SKIP_CHECK=true ;;
+        --dry-run)
+            DRY_RUN=true
+            ;;
+        --no-check)
+            SKIP_CHECK=true
+            ;;
     esac
 done
 
-if [[ "$SKIP_CHECK" = false ]]; then
-    msg "Checking for updates..."
+if [[ "$SKIP_CHECK" = false ]]; then 
     check_updates "$@"
 fi
 
 TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
-[[ -z "$TYPE" ]] && exit 0
+if [[ -z "$TYPE" ]]; then
+    exit 0
+fi
 
-msg "Fetching $TYPE resources..."
 SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE")
-[[ -z "$SELECTED_RES" ]] && exit 0
+if [[ -z "$SELECTED_RES" ]]; then
+    exit 0
+fi
 
 NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
 RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
 
-# Restored: Clear any stale pods before proceeding
 kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
 
 PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
-[[ -z "$PVC_NAME" ]] && exit 0
+if [[ -z "$PVC_NAME" ]]; then
+    exit 0
+fi
 
-# --- Sizing Logic ---
 CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
 CURRENT_UNIT=${CURRENT_SIZE//[0-9.]/}
 
-# Robust Pod Selection
 ACTIVE_POD=$(kubectl get pods -n "$NAMESPACE" --field-selector=status.phase=Running -o json | yq ".items[] | select(.spec.volumes[].persistentVolumeClaim.claimName == \"$PVC_NAME\") | .metadata.name" | head -n 1)
 
 if [[ -n "$ACTIVE_POD" ]]; then
     MOUNT_NAME=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.volumes[?(@.persistentVolumeClaim.claimName=="'"$PVC_NAME"'")].name}')
     MOUNT_PATH=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.containers[*].volumeMounts[?(@.name=="'"$MOUNT_NAME"'")].mountPath}')
     
-    msg "Calculating usage on $MOUNT_PATH via pod $ACTIVE_POD..."
-    usage_data=$(kubectl exec -n "$NAMESPACE" "$ACTIVE_POD" -- du -sb "$MOUNT_PATH" 2>/dev/null || echo "0")
-    SOURCE_BYTES=$(echo "$usage_data" | awk '{print $1}')
+    msg "Calculating usage on $MOUNT_PATH..."
+    SOURCE_BYTES=$(kubectl exec -n "$NAMESPACE" "$ACTIVE_POD" -- du -sb "$MOUNT_PATH" | awk '{print $1}')
     SOURCE_HUMAN=$(numfmt --to=iec-i --suffix=B --format="%.2f" "$SOURCE_BYTES")
     TEN_PERCENT_BUFFER=$(echo "$SOURCE_BYTES * 1.1" | bc | cut -d'.' -f1)
     MIN_REC=$(numfmt --to=iec-i --suffix=B --format="%.2f" "$TEN_PERCENT_BUFFER")
-
+    
     echo -e "Current: $CURRENT_SIZE | Usage: $SOURCE_HUMAN | Min Rec (+10%): $MIN_REC"
+    
+    # Restored Loop: Reprompt if size is too small
     while true; do
-        read -r -p "Enter New Size: " USER_INPUT
-        if [[ -z "$USER_INPUT" ]]; then continue; fi
+        read -r -p "Enter New Size (e.g., 50 or 50Gi): " USER_INPUT
+        if [[ -z "$USER_INPUT" ]]; then
+            continue
+        fi
         
         if [[ "$USER_INPUT" =~ ^[0-9.]+$ ]]; then
             NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}"
@@ -192,30 +219,27 @@ if [[ -n "$ACTIVE_POD" ]]; then
             NEW_SIZE="$USER_INPUT"
         fi
         
+        # Validation Logic
         CLEAN_NEW_SIZE=${NEW_SIZE//i/}
         NEW_SIZE_BYTES=$(numfmt --from=iec "$CLEAN_NEW_SIZE")
 
         if [[ "$SOURCE_BYTES" -gt "$NEW_SIZE_BYTES" ]]; then
-            echo -e "\033[31mError: New size smaller than data!\033[0m"
+            echo -e "\033[31mError: New size ($NEW_SIZE) is smaller than data ($SOURCE_HUMAN)!\033[0m"
             continue
         elif [[ "$TEN_PERCENT_BUFFER" -gt "$NEW_SIZE_BYTES" ]]; then
             read -r -p "Warning: Less than 10% overhead. Continue? (y/n): " WC
-            if [[ "$WC" == "y" ]]; then
-                break
-            else
-                continue
+            if [[ "$WC" != "y" ]]; then 
+                continue 
             fi
         fi
         break
     done
 else
-    highlight "⚠️ No running pods found using PVC '$PVC_NAME'. Cannot auto-calculate usage."
-    read -r -p "Enter New Size (e.g., 10Gi): " NEW_SIZE
+    read -r -p "No pod running. Enter New Size (e.g., 10Gi): " NEW_SIZE
 fi
 
-if [[ "$DRY_RUN" = true ]]; then
-    msg "Dry Run: Generated PVC Manifest"
-    kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\""
+if [[ "$DRY_RUN" = true ]]; then 
+    kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq ".spec.resources.requests.storage = \"$NEW_SIZE\""
     exit 0
 fi
 
@@ -224,23 +248,29 @@ trap rollback ERR
 
 msg "Scaling down $TYPE/$RES_NAME..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
-kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=60s --ignore-not-found 2>/dev/null || true
+kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=120s --ignore-not-found || true
 
 msg "Creating staging PVC..."
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '.metadata.name = "'"$TEMP_PVC_NAME"'" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.annotations["pv.kubernetes.io/bind-completed"], .metadata.annotations["pv.kubernetes.io/bound-by-controller"], .spec.volumeName)' | kubectl apply -f -
-kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$TEMP_PVC_NAME" -n "$NAMESPACE" --timeout=120s
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$TEMP_PVC_NAME" -n "$NAMESPACE" --timeout=300s
 
 sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "shrink-to-temp"
 
 msg "Recreating original PVC at $NEW_SIZE..."
-kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\"" | kubectl replace --force -f -
-kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$PVC_NAME" -n "$NAMESPACE" --timeout=120s
+kubectl delete pvc "$PVC_NAME" -n "$NAMESPACE" --wait=true
+kubectl get pvc "$TEMP_PVC_NAME" -n "$NAMESPACE" -o yaml | yq '.metadata.name = "'"$PVC_NAME"'" | .spec.resources.requests.storage = "'"$NEW_SIZE"'" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.annotations["pv.kubernetes.io/bind-completed"], .metadata.annotations["pv.kubernetes.io/bound-by-controller"], .spec.volumeName)' | kubectl apply -f -
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$PVC_NAME" -n "$NAMESPACE" --timeout=300s
 
 sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "shrink-back"
 
 trap - ERR
-msg "Scaling up $TYPE/$RES_NAME..."
+msg "Restoring workload..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
-kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE"
+kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE" --timeout=300s
+
+msg "Verifying Pod Readiness..."
+kubectl wait --for=condition=Ready pods -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=300s
+
+msg "Shrink Complete. Cleaning up temporary volume..."
 kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
-msg "Shrink Successful!"
+msg "Success!"
