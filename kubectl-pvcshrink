@@ -95,7 +95,7 @@ sync_and_verify() {
     start_time=$(date +%s)
     msg "Syncing $src_pvc -> $dst_pvc..."
     
-    # Create/Replace Pod logic remains the same...
+    # Create/Replace the Sync Pod
     cat <<EOF | kubectl replace --force -f -
 apiVersion: v1
 kind: Pod
@@ -106,7 +106,7 @@ spec:
   containers:
   - name: rsync
     image: $RSYNC_IMAGE
-    command: ["sh", "-c", "rsync -avh --inplace --no-perms --no-owner --no-group --info=progress2 /src/ /dst/ && echo 'Sync Complete' && tail -f /dev/null"]
+    command: ["sh", "-c", "rsync -avh --inplace --no-perms --no-owner --no-group --info=progress2 /src/ /dst/ && echo 'SYNC_DONE' && tail -f /dev/null"]
     volumeMounts: [{name: src, mountPath: /src}, {name: dst, mountPath: /dst}]
   restartPolicy: Never
   volumes:
@@ -116,16 +116,16 @@ spec:
     persistentVolumeClaim: {claimName: $dst_pvc}
 EOF
 
-    kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=120s || rollback
+    # Added a spinner-like wait for the Pod to be Ready
+    msg "Initializing storage and sync pod..."
+    kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=120s
     
-    msg "Progress:"
-    # 1. Added --prefix=false to remove "Pod/rsync" junk from the line
-    # 2. Forced unbuffering on every segment of the pipe
-    # 3. Use 'stdbuf -i0 -o0 -e0' for total pass-through
+    msg "Progress (Live):"
+    # FIXED: Added 'grep -m1' which is more reliable than sed for partial line matches in unbuffered streams
     kubectl logs -f "$job_name" -n "$NAMESPACE" --prefix=false | \
         stdbuf -i0 -o0 -e0 tr '\r' '\n' | \
         stdbuf -i0 -o0 -e0 tee "$log_file" | \
-        stdbuf -i0 -o0 -e0 sed '/Sync Complete/q' | \
+        stdbuf -i0 -o0 -e0 grep -m1 "SYNC_DONE" | \
         stdbuf -i0 -o0 -e0 tr '\n' '\r'
     
     echo -e "\n"
@@ -133,9 +133,7 @@ EOF
     local end_time=$(date +%s)
     local duration=$((end_time - start_time))
 
-    # Verification logic remains the same...
     msg "Verifying data integrity..."
-    # ...
     local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT
     
     SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src | awk '{print $1}')
@@ -153,7 +151,8 @@ EOF
     read -r -p "Proceed with migration? (y/n): " CONFIRM
     [[ $CONFIRM != "y" ]] && rollback
     
-    kubectl delete pod "$job_name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1}
+    kubectl delete pod "$job_name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1
+}
 
 # --- 2. Main Execution Entry Point ---
 
@@ -203,7 +202,10 @@ fi
 ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
 
 trap rollback ERR
+# Scaling Down
+msg "Scaling down $TYPE/$RES_NAME to 0 replicas..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
+kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=60s || msg "Waiting for pods to terminate..."
 
 msg "Creating staging PVC..."
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '
@@ -234,6 +236,10 @@ kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$PVC_NAME" -n "$NAMESPA
 sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "shrink-back"
 
 trap - ERR
+
+msg "Scaling $TYPE/$RES_NAME back to $ORIG_REPLICAS replicas..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
+kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE"
+
 kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
 msg "Shrink Successful!"
