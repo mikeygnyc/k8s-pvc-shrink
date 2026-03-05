@@ -2,7 +2,7 @@
 set -e
 
 # --- 1. Constants & Functions ---
-VERSION="v1.1.13"
+VERSION="v1.1.15"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
@@ -25,7 +25,7 @@ check_deps() {
         fi
     done
 
-    if [ ${#missing_deps[@]} -ne 0 ]; then
+    if [[ ${#missing_deps[@]} -ne 0 ]]; then
         echo -e "\033[31m[!] Missing Dependencies:\033[0m"
         for item in "${missing_deps[@]}"; do echo "  - $item"; done
         echo -e "\nPlease install them (e.g., brew install coreutils bc fzf yq)."
@@ -34,7 +34,6 @@ check_deps() {
 }
 
 check_updates() {
-    msg "Checking for updates..."
     local REMOTE_VERSION
     REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
 
@@ -134,9 +133,113 @@ EOF
 check_deps
 mkdir -p "$LOG_DIR"
 
+# Parse arguments
+DRY_RUN=false
+SKIP_CHECK=false
 for arg in "$@"; do
     case $arg in
         --version|-v) echo "kubectl-pvcshrink $VERSION"; exit 0 ;;
         --help|-h) echo "Usage: kubectl pvcshrink [--dry-run] [--no-check]"; exit 0 ;;
+        --dry-run) DRY_RUN=true ;;
+        --no-check) SKIP_CHECK=true ;;
     esac
 done
+
+if [[ "$SKIP_CHECK" = false ]]; then
+    msg "Checking for updates..."
+    check_updates
+fi
+
+TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
+[[ -z "$TYPE" ]] && exit 0
+
+msg "Fetching $TYPE resources..."
+SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE")
+[[ -z "$SELECTED_RES" ]] && exit 0
+
+NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
+RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
+kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
+
+PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
+[[ -z "$PVC_NAME" ]] && exit 0
+
+# --- Sizing Logic ---
+CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
+CURRENT_UNIT=${CURRENT_SIZE//[0-9.]/}
+ACTIVE_POD=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$RES_NAME" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+
+if [[ -n "$ACTIVE_POD" ]]; then
+    MOUNT_NAME=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.volumes[?(@.persistentVolumeClaim.claimName=="'"$PVC_NAME"'")].name}')
+    MOUNT_PATH=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.containers[*].volumeMounts[?(@.name=="'"$MOUNT_NAME"'")].mountPath}')
+    
+    msg "Calculating usage on $MOUNT_PATH..."
+    usage_data=$(kubectl exec -n "$NAMESPACE" "$ACTIVE_POD" -- du -sb "$MOUNT_PATH")
+    SOURCE_BYTES=$(echo "$usage_data" | awk '{print $1}')
+    SOURCE_HUMAN=$(numfmt --to=iec-i --suffix=B --format="%.2f" "$SOURCE_BYTES")
+    TEN_PERCENT_BUFFER=$(echo "$SOURCE_BYTES * 1.1" | bc | cut -d'.' -f1)
+    MIN_REC=$(numfmt --to=iec-i --suffix=B --format="%.2f" "$TEN_PERCENT_BUFFER")
+
+    echo -e "Current: $CURRENT_SIZE | Usage: $SOURCE_HUMAN | Min Rec (+10%): $MIN_REC"
+    while true; do
+        read -r -p "Enter New Size: " USER_INPUT
+        [[ -z "$USER_INPUT" ]] && continue
+
+        if [[ "$USER_INPUT" =~ ^[0-9.]+$ ]]; then
+            NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}"
+        else
+            NEW_SIZE="$USER_INPUT"
+        fi
+
+        CLEAN_NEW_SIZE=${NEW_SIZE//i/}
+        NEW_SIZE_BYTES=$(numfmt --from=iec "$CLEAN_NEW_SIZE")
+
+        if [[ "$SOURCE_BYTES" -gt "$NEW_SIZE_BYTES" ]]; then
+            echo -e "\033[31mError: New size smaller than data!\033[0m"
+            continue
+        elif [[ "$TEN_PERCENT_BUFFER" -gt "$NEW_SIZE_BYTES" ]]; then
+            read -r -p "Warning: Less than 10% overhead. Continue? (y/n): " WC
+            if [[ "$WC" == "y" ]]; then break; else continue; fi
+        fi
+        break
+    done
+else
+    read -r -p "No pod running. Enter New Size: " USER_INPUT
+    if [[ "$USER_INPUT" =~ ^[0-9.]+$ ]]; then
+        NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}"
+    else
+        NEW_SIZE="$USER_INPUT"
+    fi
+fi
+
+if [[ "$DRY_RUN" = true ]]; then
+    msg "Dry Run: Generated PVC Manifest"
+    kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\""
+    exit 0
+fi
+
+ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
+trap rollback ERR
+
+msg "Scaling down $TYPE/$RES_NAME..."
+kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
+kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=60s --ignore-not-found
+
+msg "Creating staging PVC..."
+kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '.metadata.name = "'"$TEMP_PVC_NAME"'" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.annotations["pv.kubernetes.io/bind-completed"], .metadata.annotations["pv.kubernetes.io/bound-by-controller"], .spec.volumeName)' | kubectl apply -f -
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$TEMP_PVC_NAME" -n "$NAMESPACE" --timeout=120s
+
+sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "shrink-to-temp"
+
+msg "Recreating original PVC at $NEW_SIZE..."
+kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\"" | kubectl replace --force -f -
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$PVC_NAME" -n "$NAMESPACE" --timeout=120s
+
+sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "shrink-back"
+
+trap - ERR
+msg "Scaling up $TYPE/$RES_NAME..."
+kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
+kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE"
+kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
+msg "Shrink Successful!"
