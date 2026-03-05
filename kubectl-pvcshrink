@@ -2,7 +2,7 @@
 set -e
 
 # --- 1. Constants & Functions ---
-VERSION="v1.1.15"
+VERSION="v1.1.17"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
@@ -33,6 +33,7 @@ check_deps() {
     fi
 }
 
+# Fix SC2120: Arguments are not passed to this function directly
 check_updates() {
     local REMOTE_VERSION
     REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
@@ -50,6 +51,7 @@ check_updates() {
             if curl -fL -sSH "Cache-Control: no-cache" "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
                 mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
                 msg "Update successful. Restarting..."
+                # We use the script's global arguments for the restart
                 exec "$SCRIPT_PATH" "$@"
             fi
         fi
@@ -147,6 +149,7 @@ done
 
 if [[ "$SKIP_CHECK" = false ]]; then
     msg "Checking for updates..."
+    # Fix SC2119: Function is called without arguments correctly
     check_updates
 fi
 
