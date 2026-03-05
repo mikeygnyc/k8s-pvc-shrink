@@ -130,8 +130,10 @@ EOF
     
     echo -e "\n"
     
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
+    local end_time
+    end_time=$(date +%s)
+    local duration
+    duration=$((end_time - start_time))
 
     msg "Verifying data integrity..."
     local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT
