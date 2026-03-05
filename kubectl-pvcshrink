@@ -2,7 +2,7 @@
 set -e
 
 # --- 1. Constants & Functions ---
-VERSION="v1.1.14"
+VERSION="v1.1.20"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
@@ -33,7 +33,6 @@ check_deps() {
     fi
 }
 
-# Fix SC2120: Explicitly accepting arguments to pass to the exec call
 check_updates() {
     local REMOTE_VERSION
     REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
@@ -51,7 +50,6 @@ check_updates() {
             if curl -fL -sSH "Cache-Control: no-cache" "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
                 mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
                 msg "Update successful. Restarting..."
-                # Re-exec with the arguments passed into THIS function
                 exec "$SCRIPT_PATH" "$@"
             fi
         fi
@@ -133,7 +131,6 @@ EOF
 check_deps
 mkdir -p "$LOG_DIR"
 
-# Parse arguments
 DRY_RUN=false
 SKIP_CHECK=false
 for arg in "$@"; do
@@ -147,7 +144,6 @@ done
 
 if [[ "$SKIP_CHECK" = false ]]; then
     msg "Checking for updates..."
-    # Fix SC2119: Passing the script's arguments into the function
     check_updates "$@"
 fi
 
@@ -160,6 +156,8 @@ SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.nam
 
 NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
 RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
+
+# Restored: Clear any stale pods before proceeding
 kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
 
 PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
@@ -168,14 +166,16 @@ PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.t
 # --- Sizing Logic ---
 CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
 CURRENT_UNIT=${CURRENT_SIZE//[0-9.]/}
-ACTIVE_POD=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$RES_NAME" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+
+# Robust Pod Selection
+ACTIVE_POD=$(kubectl get pods -n "$NAMESPACE" --field-selector=status.phase=Running -o json | yq ".items[] | select(.spec.volumes[].persistentVolumeClaim.claimName == \"$PVC_NAME\") | .metadata.name" | head -n 1)
 
 if [[ -n "$ACTIVE_POD" ]]; then
     MOUNT_NAME=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.volumes[?(@.persistentVolumeClaim.claimName=="'"$PVC_NAME"'")].name}')
     MOUNT_PATH=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.containers[*].volumeMounts[?(@.name=="'"$MOUNT_NAME"'")].mountPath}')
     
-    msg "Calculating usage on $MOUNT_PATH..."
-    usage_data=$(kubectl exec -n "$NAMESPACE" "$ACTIVE_POD" -- du -sb "$MOUNT_PATH")
+    msg "Calculating usage on $MOUNT_PATH via pod $ACTIVE_POD..."
+    usage_data=$(kubectl exec -n "$NAMESPACE" "$ACTIVE_POD" -- du -sb "$MOUNT_PATH" 2>/dev/null || echo "0")
     SOURCE_BYTES=$(echo "$usage_data" | awk '{print $1}')
     SOURCE_HUMAN=$(numfmt --to=iec-i --suffix=B --format="%.2f" "$SOURCE_BYTES")
     TEN_PERCENT_BUFFER=$(echo "$SOURCE_BYTES * 1.1" | bc | cut -d'.' -f1)
@@ -184,14 +184,14 @@ if [[ -n "$ACTIVE_POD" ]]; then
     echo -e "Current: $CURRENT_SIZE | Usage: $SOURCE_HUMAN | Min Rec (+10%): $MIN_REC"
     while true; do
         read -r -p "Enter New Size: " USER_INPUT
-        [[ -z "$USER_INPUT" ]] && continue
-
+        if [[ -z "$USER_INPUT" ]]; then continue; fi
+        
         if [[ "$USER_INPUT" =~ ^[0-9.]+$ ]]; then
             NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}"
         else
             NEW_SIZE="$USER_INPUT"
         fi
-
+        
         CLEAN_NEW_SIZE=${NEW_SIZE//i/}
         NEW_SIZE_BYTES=$(numfmt --from=iec "$CLEAN_NEW_SIZE")
 
@@ -200,17 +200,17 @@ if [[ -n "$ACTIVE_POD" ]]; then
             continue
         elif [[ "$TEN_PERCENT_BUFFER" -gt "$NEW_SIZE_BYTES" ]]; then
             read -r -p "Warning: Less than 10% overhead. Continue? (y/n): " WC
-            if [[ "$WC" == "y" ]]; then break; else continue; fi
+            if [[ "$WC" == "y" ]]; then
+                break
+            else
+                continue
+            fi
         fi
         break
     done
 else
-    read -r -p "No pod running. Enter New Size: " USER_INPUT
-    if [[ "$USER_INPUT" =~ ^[0-9.]+$ ]]; then
-        NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}"
-    else
-        NEW_SIZE="$USER_INPUT"
-    fi
+    highlight "⚠️ No running pods found using PVC '$PVC_NAME'. Cannot auto-calculate usage."
+    read -r -p "Enter New Size (e.g., 10Gi): " NEW_SIZE
 fi
 
 if [[ "$DRY_RUN" = true ]]; then
@@ -224,7 +224,7 @@ trap rollback ERR
 
 msg "Scaling down $TYPE/$RES_NAME..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
-kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=60s --ignore-not-found
+kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=60s --ignore-not-found 2>/dev/null || true
 
 msg "Creating staging PVC..."
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '.metadata.name = "'"$TEMP_PVC_NAME"'" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.annotations["pv.kubernetes.io/bind-completed"], .metadata.annotations["pv.kubernetes.io/bound-by-controller"], .spec.volumeName)' | kubectl apply -f -
