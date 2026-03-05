@@ -1,23 +1,25 @@
 #!/bin/bash
 set -e
 
-# --- 1. Constants & Functions (Defined First) ---
-VERSION="v1.1.12"
+# --- 1. Constants & Functions ---
+VERSION="v1.1.11"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
 RSYNC_IMAGE="instrumentisto/rsync-ssh"
 LOG_DIR="./shrink_logs"
 
-# Use \033 for better compatibility across different terminals/shells
 msg() { echo -e "\033[32m[INFO]\033[0m $1"; }
 err() { echo -e "\033[31m[ERROR]\033[0m $1"; exit 1; }
 highlight() { echo -e "\033[33m$1\033[0m"; }
 
-# Pre-flight Dependency Check
+version_gt() {
+    test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"
+}
+
 check_deps() {
     local missing_deps=()
-    for dep in kubectl fzf yq column curl; do
+    for dep in kubectl fzf yq column curl bc numfmt; do
         if ! command -v "$dep" >/dev/null 2>&1; then
             missing_deps+=("$dep")
         fi
@@ -25,18 +27,10 @@ check_deps() {
 
     if [ ${#missing_deps[@]} -ne 0 ]; then
         echo -e "\033[31m[!] Missing Dependencies:\033[0m"
-        for item in "${missing_deps[@]}"; do
-            echo "  - $item"
-        done
-        echo -e "\nPlease install them (e.g., brew install fzf yq)."
+        for item in "${missing_deps[@]}"; do echo "  - $item"; done
+        echo -e "\nPlease install them (e.g., brew install coreutils bc fzf yq)."
         exit 1
     fi
-}
-
-# Helper function to compare semantic versions
-# Returns 0 if $1 <= $2, 1 if $1 > $2
-version_gt() {
-    test "$(printf '%s\n' "$@" | sort -V | head -n 1)" != "$1"
 }
 
 check_updates() {
@@ -44,11 +38,9 @@ check_updates() {
     local REMOTE_VERSION
     REMOTE_VERSION=$(curl -fL -sS --connect-timeout 2 -H "Cache-Control: no-cache" "$UPDATE_URL" | tr -d '[:space:]' || echo "$VERSION")
 
-    # Clean the 'v' prefix if present for comparison
     local clean_remote="${REMOTE_VERSION#v}"
     local clean_current="${VERSION#v}"
 
-    # Only notify if the remote version is actually GREATER than current
     if version_gt "$clean_remote" "$clean_current"; then
         highlight "✨ A new version ($REMOTE_VERSION) is available! (Current: $VERSION)"
         read -r -p "Update and restart now? (y/n): " UPDATE_NOW
@@ -56,24 +48,14 @@ check_updates() {
             local SCRIPT_PATH
             SCRIPT_PATH=$(command -v kubectl-pvcshrink || echo "$0")
             local TEMP_FILE="/tmp/kubectl-pvcshrink-update"
-
-            msg "Downloading update..."
             if curl -fL -sSH "Cache-Control: no-cache" "$RAW_SCRIPT_URL" -o "$TEMP_FILE"; then
-                if [ -w "$SCRIPT_PATH" ]; then
-                    mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
-                else
-                    sudo mv "$TEMP_FILE" "$SCRIPT_PATH" && sudo chmod +x "$SCRIPT_PATH"
-                fi
+                mv "$TEMP_FILE" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
                 msg "Update successful. Restarting..."
                 exec "$SCRIPT_PATH" "$@"
-            else
-                err "Update download failed."
             fi
         fi
-        echo "------------------------------------------------"
     fi
 }
-
 
 rollback() {
     echo -e "\n"
@@ -85,17 +67,11 @@ rollback() {
 }
 
 sync_and_verify() {
-    local src_pvc=$1
-    local dst_pvc=$2
-    local job_name=$3
-    local log_file
+    local src_pvc=$1 dst_pvc=$2 job_name=$3 log_file
     log_file="$LOG_DIR/${job_name}_$(date +%Y%m%d_%H%M%S).log"
+    local start_time=$(date +%s)
     
-    local start_time
-    start_time=$(date +%s)
-    msg "Syncing $src_pvc -> $dst_pvc..."
-    
-    # Create/Replace the Sync Pod
+    msg "Preparing sync environment ($job_name)..."
     cat <<EOF | kubectl replace --force -f -
 apiVersion: v1
 kind: Pod
@@ -104,10 +80,14 @@ metadata:
   namespace: $NAMESPACE
 spec:
   containers:
-  - name: rsync
+  - name: sync
     image: $RSYNC_IMAGE
-    command: ["sh", "-c", "rsync -avh --inplace --no-perms --no-owner --no-group --info=progress2 /src/ /dst/ && echo 'SYNC_DONE' && tail -f /dev/null"]
-    volumeMounts: [{name: src, mountPath: /src}, {name: dst, mountPath: /dst}]
+    command: ["sh", "-c", "tail -f /dev/null"]
+    volumeMounts:
+    - name: src
+      mountPath: /src
+    - name: dst
+      mountPath: /dst
   restartPolicy: Never
   volumes:
   - name: src
@@ -116,52 +96,36 @@ spec:
     persistentVolumeClaim: {claimName: $dst_pvc}
 EOF
 
-    # Added a spinner-like wait for the Pod to be Ready
-    msg "Initializing storage and sync pod..."
-    kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=120s
-    
-    msg "Progress (Live):"
-    # FIXED: Added 'grep -m1' which is more reliable than sed for partial line matches in unbuffered streams
-    kubectl logs -f "$job_name" -n "$NAMESPACE" --prefix=false | \
-        stdbuf -i0 -o0 -e0 tr '\r' '\n' | \
-        stdbuf -i0 -o0 -e0 tee "$log_file" | \
-        stdbuf -i0 -o0 -e0 grep -m1 "SYNC_DONE" | \
-        stdbuf -i0 -o0 -e0 tr '\n' '\r'
-    
-    echo -e "\n"
-    
-    local end_time
-    end_time=$(date +%s)
-    local duration
-    duration=$((end_time - start_time))
+    kubectl wait --for=condition=Ready "pod/$job_name" -n "$NAMESPACE" --timeout=60s >/dev/null
 
-    msg "Verifying data integrity..."
+    msg "Syncing data (Live Progress):"
+    if ! kubectl exec "$job_name" -n "$NAMESPACE" -- \
+        rsync -avh --inplace --no-perms --no-owner --no-group --info=progress2 /src/ /dst/ | tee "$log_file"; then
+        rollback
+    fi
+
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+
+    msg "Verifying integrity..."
     local SRC_SIZE DST_SIZE SRC_COUNT DST_COUNT
-    
     SRC_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /src | awk '{print $1}')
     DST_SIZE=$(kubectl exec "$job_name" -n "$NAMESPACE" -- du -sh /dst | awk '{print $1}')
     SRC_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /src | wc -l")
     DST_COUNT=$(kubectl exec "$job_name" -n "$NAMESPACE" -- sh -c "ls -1R /dst | wc -l")
 
-    echo -e "\n--- Sync Summary ---"
-    echo -e "Duration:\t${duration} seconds"
-    echo -e "METRIC\tSOURCE\tDEST\tMATCH"
-    echo -e "Size\t$SRC_SIZE\t$DST_SIZE\t$([[ "$SRC_SIZE" == "$DST_SIZE" ]] && echo "✅" || echo "❌")"
-    echo -e "Files\t$SRC_COUNT\t$DST_COUNT\t$([[ "$SRC_COUNT" == "$DST_COUNT" ]] && echo "✅" || echo "❌")" | column -t -s $'\t'
-    echo -e "--------------------\n"
-
-    read -r -p "Proceed with migration? (y/n): " CONFIRM
-    [[ $CONFIRM != "y" ]] && rollback
+    echo -e "\n--- Sync Summary ---\nDuration: ${duration}s"
+    echo -e "METRIC\tSOURCE\tDEST\tMATCH\nSize\t$SRC_SIZE\t$DST_SIZE\t$([[ "$SRC_SIZE" == "$DST_SIZE" ]] && echo "✅" || echo "❌")\nFiles\t$SRC_COUNT\t$DST_COUNT\t$([[ "$SRC_COUNT" == "$DST_COUNT" ]] && echo "✅" || echo "❌")" | column -t -s $'\t'
     
+    read -r -p "Proceed? (y/n): " CONFIRM
+    [[ $CONFIRM != "y" ]] && rollback
     kubectl delete pod "$job_name" -n "$NAMESPACE" --wait=false >/dev/null 2>&1
 }
 
-# --- 2. Main Execution Entry Point ---
-
+# --- 2. Main Execution ---
 check_deps
 mkdir -p "$LOG_DIR"
 
-# Argument Parsing
 for arg in "$@"; do
     case $arg in
         --version|-v) echo "kubectl-pvcshrink $VERSION"; exit 0 ;;
@@ -169,14 +133,11 @@ for arg in "$@"; do
     esac
 done
 
-if [[ "$*" != *"--no-check"* ]]; then
-    check_updates "$@"
-fi
+[[ "$*" != *"--no-check"* ]] && check_updates "$@"
 
 DRY_RUN=false
 [[ "$*" == *"--dry-run"* ]] && DRY_RUN=true
 
-# --- Resource Selection ---
 TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
 [[ -z "$TYPE" ]] && exit 0
 
@@ -185,16 +146,44 @@ SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.nam
 
 NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
 RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
-
-# Pre-flight cleanup: Ensure no previous pods exist in this namespace
-# This prevents the "Forbidden" error if you restart the script quickly
 kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
 
 PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
 [[ -z "$PVC_NAME" ]] && exit 0
 
+# --- Sizing Logic ---
 CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
-read -r -p "Current size: $CURRENT_SIZE. Enter New Size (e.g. 5Gi): " NEW_SIZE
+CURRENT_UNIT=$(echo "$CURRENT_SIZE" | sed 's/[0-9.]//g')
+ACTIVE_POD=$(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$RES_NAME" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+
+if [[ -n "$ACTIVE_POD" ]]; then
+    MOUNT_NAME=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.volumes[?(@.persistentVolumeClaim.claimName=="'"$PVC_NAME"'")].name}')
+    MOUNT_PATH=$(kubectl get pod "$ACTIVE_POD" -n "$NAMESPACE" -o jsonpath='{.spec.containers[*].volumeMounts[?(@.name=="'"$MOUNT_NAME"'")].mountPath}')
+    
+    msg "Calculating usage on $MOUNT_PATH..."
+    SOURCE_BYTES=$(kubectl exec -n "$NAMESPACE" "$ACTIVE_POD" -- du -sb "$MOUNT_PATH" | awk '{print $1}')
+    SOURCE_HUMAN=$(numfmt --to=iec-i --suffix=B --format="%.2f" "$SOURCE_BYTES")
+    TEN_PERCENT_BUFFER=$(echo "$SOURCE_BYTES * 1.1" | bc | cut -d'.' -f1)
+    MIN_REC=$(numfmt --to=iec-i --suffix=B --format="%.2f" "$TEN_PERCENT_BUFFER")
+
+    echo -e "Current: $CURRENT_SIZE | Usage: $SOURCE_HUMAN | Min Rec (+10%): $MIN_REC"
+    while true; do
+        read -r -p "Enter New Size: " USER_INPUT
+        [[ "$USER_INPUT" =~ ^[0-9.]+$ ]] && NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}" || NEW_SIZE="$USER_INPUT"
+        NEW_SIZE_BYTES=$(numfmt --from=iec "$(echo "$NEW_SIZE" | sed 's/i//g')")
+
+        if [ "$SOURCE_BYTES" -gt "$NEW_SIZE_BYTES" ]; then
+            echo -e "\033[31mError: New size smaller than data!\033[0m"; continue
+        elif [ "$TEN_PERCENT_BUFFER" -gt "$NEW_SIZE_BYTES" ]; then
+            read -r -p "Warning: Less than 10% overhead. Continue? (y/n): " WC
+            [[ "$WC" == "y" ]] && break || continue
+        fi
+        break
+    done
+else
+    read -r -p "No pod running. Enter New Size: " USER_INPUT
+    [[ "$USER_INPUT" =~ ^[0-9.]+$ ]] && NEW_SIZE="${USER_INPUT}${CURRENT_UNIT}" || NEW_SIZE="$USER_INPUT"
+fi
 
 if [ "$DRY_RUN" = true ]; then
     kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\""
@@ -202,46 +191,27 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
-
 trap rollback ERR
-# Scaling Down
-msg "Scaling down $TYPE/$RES_NAME to 0 replicas..."
+
+msg "Scaling down $TYPE/$RES_NAME..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
-kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=60s || msg "Waiting for pods to terminate..."
+kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=60s --ignore-not-found
 
 msg "Creating staging PVC..."
-kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '
-  .metadata.name = "'"$TEMP_PVC_NAME"'" | 
-  del(
-    .status, 
-    .metadata.uid, 
-    .metadata.resourceVersion, 
-    .metadata.creationTimestamp, 
-    .metadata.annotations["pv.kubernetes.io/bind-completed"],
-    .metadata.annotations["pv.kubernetes.io/bound-by-controller"],
-    .spec.volumeName
-  )' | kubectl apply -f -
+kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '.metadata.name = "'"$TEMP_PVC_NAME"'" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.annotations["pv.kubernetes.io/bind-completed"], .metadata.annotations["pv.kubernetes.io/bound-by-controller"], .spec.volumeName)' | kubectl apply -f -
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$TEMP_PVC_NAME" -n "$NAMESPACE" --timeout=120s
 
-msg "Waiting for $TEMP_PVC_NAME to bind..."
-kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$TEMP_PVC_NAME" -n "$NAMESPACE" --timeout=120s || rollback
-
-# 2. Sync Data to Staging
 sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "shrink-to-temp"
 
-# 3. Delete & Recreate original PVC with new size
-kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\" | .metadata.annotations |= with_entries(select(.key == \"volume.autoscaler.kubernetes.io/ignore\"))" | kubectl replace --force -f -
+msg "Recreating original PVC at $NEW_SIZE..."
+kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq "del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .spec.volumeName) | .spec.resources.requests.storage = \"$NEW_SIZE\"" | kubectl replace --force -f -
+kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$PVC_NAME" -n "$NAMESPACE" --timeout=120s
 
-msg "Waiting for $PVC_NAME to re-bind at new size..."
-kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$PVC_NAME" -n "$NAMESPACE" --timeout=120s || rollback
-
-# 4. Sync Data back to original
 sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "shrink-back"
 
 trap - ERR
-
-msg "Scaling $TYPE/$RES_NAME back to $ORIG_REPLICAS replicas..."
+msg "Scaling up $TYPE/$RES_NAME..."
 kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
 kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE"
-
 kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
 msg "Shrink Successful!"

@@ -1,47 +1,65 @@
-# Kube-PVC-Shrink 🚀
+# kubectl-pvcshrink
 
-A high-integrity CLI tool for shrinking Kubernetes Persistent Volume Claims (PVCs). This tool uses a "Double-Hop" copy staging method to ensure data safety. While this tool can be used to resize a PVC in either direction it is designed to shrink a PVC as generally enlarging a PVC can be done online.
+A robust CLI utility to shrink Persistent Volume Claims (PVCs) in Kubernetes. Since Kubernetes does not natively support shrinking volumes, this script automates the complex process of scaling workloads, migrating data via `rsync`, and verifying integrity.
 
-## ⚡️ Instant Installation
+## ⚡️ Installation
 Run this one-liner to automatically detect your PATH (Homebrew or /usr/local/bin) and install the latest version:
 
 ```bash
 curl -fsSLH "Cache-Control: no-cache" https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/install.sh | bash
 ```
 
-## ✨ Key Features
-* **Interactive UI**: Uses `fzf` to let you visually pick your Deployment, StatefulSet, and PVC.
-* **In-Place Updates**: Automatically detects and installs newer versions from GitHub, then restarts the session seamlessly.
-* **Safety Rollback**: If a data sync fails, the script automatically scales your resources back up to their original state.
-* **Data Verification**: Generates a side-by-side table comparing **File Count** and **Disk Usage (du)**.
-* **SMB Optimized**: Uses `rsync` flags that prevent permission/ownership errors.
-* **Audit Logging**: Detailed logs of every file moved are saved to `./migration_logs`.
+## ✨ Features
 
-## 🛠 Prerequisites
-Ensure these are installed on your machine:
-* `kubectl` (Configured for your cluster)
-* `fzf` (Interactive filtering)
-* `yq` (YAML processing)
-* `column` (Standard on Linux/macOS)
+* **Intelligent Sizing:** Automatically calculates current data usage and prevents shrinking below the actual data size.
+* **Safety Thresholds:** Warns if the new size leaves less than 10% overhead for application stability.
+* **Real-time Progress:** Uses `kubectl exec` to provide a live, unbuffered `rsync` progress bar.
+* **Deep Metadata Cleaning:** Strips CSI-specific annotations (like `pv.kubernetes.io/bind-completed`) to prevent "Lost" PVC status during recreation.
+* **Resource Scaling:** Automatically scales Deployments or StatefulSets to 0 and back up, with live rollout tracking via `kubectl rollout status`.
+* **Data Verification:** Performs checksum-style file count and size matching after every sync.
 
-## 📖 Usage
-Once installed, simply run:
-```bash
-kubectl pvcshrink
-```
+## 📋 Prerequisites
 
-### Optional Flags:
-* `--version`: Check installed version.
-* `--no-check`: Skip the version check on startup.
-* `--dry-run`: Preview the `yq` YAML transformations without making any changes.
+The following tools must be installed on your local machine:
 
-## 🏗 Development & Releasing
-This project uses GitHub Actions to manage versions. To release a new version:
-1. Push your changes to `main`.
-2. Create and push a new git tag:
-   ```bash
-   git tag v1.x.x
-   git push origin --tags
+* `kubectl`: Connected to your cluster.
+* `fzf`: For interactive resource selection.
+* `yq` (v4+): For YAML processing.
+* `bc` & `numfmt`: For precise storage mathematics.
+* `curl` & `column`: For updates and formatting.
 
-## 🛡 License
-This project is licensed under the **MIT License**.
+## 🚀 Usage
+
+To run the script directly:
+`./kubectl-pvcshrink`
+
+To run in dry-run mode to see the generated YAML:
+`./kubectl-pvcshrink --dry-run`
+
+To skip the automatic update check:
+`./kubectl-pvcshrink --no-check`
+
+## 🔄 The Workflow
+
+1. **Selection:** Choose between `Deployment` or `StatefulSet` via an interactive menu.
+2. **Safety Check:** The script calculates actual data usage on the live pod using `du`.
+3. **Input:** Enter the new size. If you omit the unit (e.g., `50`), the script automatically appends the current unit (e.g., `Gi`).
+4. **Scaling:** Workload is scaled to 0 to ensure data consistency.
+5. **Migration 1:** Data is synced from the original PVC to a temporary "staging" PVC.
+6. **Recreation:** The original PVC is deleted and recreated at the new, smaller size.
+7. **Migration 2:** Data is synced back from staging to the new, smaller PVC.
+8. **Restore:** Workload is scaled back up to its original replica count.
+
+
+
+## 🛠 Troubleshooting
+
+### "Lost" PVC Status
+If your PVC enters a `Lost` state, it is usually because the CSI driver is trying to bind to a stale Volume ID. This script mitigates this by "Deep Cleaning" the PVC manifest, but ensure your `StorageClass` supports dynamic provisioning.
+
+### Sync Performance
+The script uses the `instrumentisto/rsync-ssh` image. If you are in an air-gapped environment, you can change the `RSYNC_IMAGE` constant at the top of the script to point to your internal registry.
+
+## 🛡 Security
+* The script requires `exec` permissions on pods to calculate disk usage and perform the sync.
+* All data remains within your cluster; `rsync` happens pod-to-pod via the cluster network.
