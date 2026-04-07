@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: temp
+  namespace: default
+spec:
+  containers:
+  - name: sync
+    image: instrumentisto/rsync-ssh
+    command: 
+      - "sh"
+      - "-c"
+      - |
+        echo "Starting database maintenance..." &&
+        cd src &&
+        echo "Removing old backup..." &&
+        rm -rf backup.db &&
+        echo "Creating new backup..." &&
+        cp frigate.db backup.db &&
+        echo "Cleaning up shared memory files..." &&
+        rm -rf frigate.db-shm &&
+        echo "Maintenance complete."
+    volumeMounts:
+    - name: src
+      mountPath: /src
+  restartPolicy: Never
+  volumes:
+  - name: src
+    persistentVolumeClaim: {claimName: frigate-data}

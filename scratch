@@ -1,0 +1,15 @@
+   0 ls -l
+   1 dh
+   2 df 0h
+   3 df -h
+   4 cd src
+   5 ls -l
+   6 rm -rf backup.db 
+   7 cp frigate.db backup.db
+   8 ls -la
+   9 rm -rf frigate.db-shm 
+  10 history
+
+
+
+  cd src && rm -rf backup.db && cp frigate.db backup.db && rm -rf frigate.db-shm 

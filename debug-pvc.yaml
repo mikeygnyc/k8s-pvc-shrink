@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: storage-debugger
+  namespace: cnpg
+spec:
+  containers:
+  - name: debug
+    image: alpine
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - mountPath: /data
+      name: pgdata
+  volumes:
+  - name: pgdata
+    persistentVolumeClaim:
+      claimName: galesnet-pgsql-1
