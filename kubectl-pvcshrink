@@ -234,6 +234,7 @@ for arg in "$@"; do
     case $arg in
         --dry-run) DRY_RUN=true ;;
         --no-check) SKIP_CHECK=true ;;
+        -v|--version) echo "$VERSION"; exit 0 ;;
     esac
 done
 
