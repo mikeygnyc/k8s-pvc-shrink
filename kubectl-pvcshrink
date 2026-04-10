@@ -141,13 +141,13 @@ cnpg_unfence() {
 
 cnpg_pause_reconciliation() {
     msg "Pausing CNPG reconciliation on cluster $CNPG_CLUSTER..."
-    kubectl annotate clusters.postgresql.cnpg.io "$CNPG_CLUSTER" -n "$NAMESPACE" cnpg.io/reconciliationPause="true" --overwrite
+    kubectl annotate clusters.postgresql.cnpg.io "$CNPG_CLUSTER" -n "$NAMESPACE" cnpg.io/reconciliationLoop="disabled" --overwrite
     CNPG_RECON_PAUSED=true
 }
 
 cnpg_resume_reconciliation() {
     msg "Resuming CNPG reconciliation on cluster $CNPG_CLUSTER..."
-    kubectl annotate clusters.postgresql.cnpg.io "$CNPG_CLUSTER" -n "$NAMESPACE" cnpg.io/reconciliationPause- --overwrite
+    kubectl annotate clusters.postgresql.cnpg.io "$CNPG_CLUSTER" -n "$NAMESPACE" cnpg.io/reconciliationLoop- --overwrite
     CNPG_RECON_PAUSED=false
 }
 
