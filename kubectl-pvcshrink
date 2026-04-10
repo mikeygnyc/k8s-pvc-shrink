@@ -187,7 +187,7 @@ EOF
 
     msg "Syncing data (Live Progress):"
     if ! kubectl exec "$job_name" -n "$NAMESPACE" -- \
-        rsync -avh --inplace --no-perms --no-owner --no-group --info=progress2 /src/ /dst/ | tee "$log_file"; then
+        rsync -avh --inplace --info=progress2 /src/ /dst/ | tee "$log_file"; then
         highlight "⚠️ Rsync reported errors. Verify logs at $log_file"
     fi
 
