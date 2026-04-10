@@ -1,9 +1,9 @@
 # kubectl-pvcshrink
 
-A robust CLI utility to shrink Persistent Volume Claims (PVCs) in Kubernetes. Since Kubernetes does not natively support shrinking volumes, this script automates the complex process of scaling workloads, migrating data via `rsync`, and verifying integrity.
+`kubectl-pvcshrink` is a kubectl plugin for safely shrinking Persistent Volume Claims (PVCs) in Kubernetes. Since Kubernetes does not natively support shrinking volumes, this tool automates the complex workflow of scaling workloads, migrating data via `rsync`, and verifying integrity.
 
 ## ⚡️ Installation
-Run this one-liner to automatically detect your PATH (Homebrew or /usr/local/bin) and install the latest version:
+Run this one-liner to install the kubectl plugin. It automatically detects your PATH (Homebrew or /usr/local/bin) and installs the latest version:
 
 ```bash
 curl -fsSLH "Cache-Control: no-cache" https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/install.sh | bash
@@ -32,14 +32,17 @@ The following tools must be installed on your local machine:
 
 ## 🚀 Usage
 
-To run the script directly:
+Primary (kubectl plugin):
+`kubectl pvcshrink`
+
+Standalone (optional):
 `./kubectl-pvcshrink`
 
-To run in dry-run mode to see the generated YAML:
-`./kubectl-pvcshrink --dry-run`
+Dry-run mode (shows generated YAML):
+`kubectl pvcshrink --dry-run`
 
-To skip the automatic update check:
-`./kubectl-pvcshrink --no-check`
+Skip the automatic update check:
+`kubectl pvcshrink --no-check`
 
 ## 🔄 The Workflow
 
