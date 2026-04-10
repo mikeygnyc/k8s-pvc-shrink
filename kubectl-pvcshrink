@@ -354,6 +354,7 @@ trap rollback ERR
 
 if [[ "$TYPE" == "cnpg" ]]; then
     cnpg_fence
+    cnpg_pause_reconciliation
     msg "Deleting CNPG instance pod $CNPG_INSTANCE..."
     kubectl delete pod "$CNPG_INSTANCE" -n "$NAMESPACE" --wait=true
 else
@@ -371,7 +372,6 @@ sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "shrink-to-temp"
 
 msg "Recreating original PVC at $NEW_SIZE..."
 if [[ "$TYPE" == "cnpg" ]]; then
-    cnpg_pause_reconciliation
     kubectl delete pvc "$PVC_NAME" -n "$NAMESPACE" --wait=true
 else
     kubectl delete pvc "$PVC_NAME" -n "$NAMESPACE" --wait=true
