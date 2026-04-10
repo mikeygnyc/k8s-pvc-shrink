@@ -16,6 +16,7 @@ curl -fsSLH "Cache-Control: no-cache" https://raw.githubusercontent.com/mikeygny
 * **Real-time Progress:** Uses `kubectl exec` to provide a live, unbuffered `rsync` progress bar.
 * **Deep Metadata Cleaning:** Strips CSI-specific annotations (like `pv.kubernetes.io/bind-completed`) to prevent "Lost" PVC status during recreation.
 * **Resource Scaling:** Automatically scales Deployments or StatefulSets to 0 and back up, with live rollout tracking via `kubectl rollout status`.
+* **CNPG Instance Shrink:** Supports CloudNativePG (CNPG) clusters by promoting a new primary if needed, fencing the target instance, shrinking its PVC, then unfencing it.
 * **Data Verification:** Performs checksum-style file count and size matching after every sync.
 
 ## 📋 Prerequisites
@@ -27,6 +28,7 @@ The following tools must be installed on your local machine:
 * `yq` (v4+): For YAML processing.
 * `bc` & `numfmt`: For precise storage mathematics.
 * `curl` & `column`: For updates and formatting.
+* `kubectl cnpg` plugin: Required only for CNPG workflows.
 
 ## 🚀 Usage
 
@@ -41,10 +43,10 @@ To skip the automatic update check:
 
 ## 🔄 The Workflow
 
-1. **Selection:** Choose between `Deployment` or `StatefulSet` via an interactive menu.
+1. **Selection:** Choose between `Deployment`, `StatefulSet`, or `CNPG` via an interactive menu (only types that exist in the cluster are shown).
 2. **Safety Check:** The script calculates actual data usage on the live pod using `du`.
 3. **Input:** Enter the new size. If you omit the unit (e.g., `50`), the script automatically appends the current unit (e.g., `Gi`).
-4. **Scaling:** Workload is scaled to 0 to ensure data consistency.
+4. **Scaling:** Workload is scaled to 0 to ensure data consistency (CNPG uses fencing on the target instance).
 5. **Migration 1:** Data is synced from the original PVC to a temporary "staging" PVC.
 6. **Recreation:** The original PVC is deleted and recreated at the new, smaller size.
 7. **Migration 2:** Data is synced back from staging to the new, smaller PVC.

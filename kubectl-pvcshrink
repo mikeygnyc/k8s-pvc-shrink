@@ -2,7 +2,7 @@
 set -e
 
 # --- 1. Constants & Functions ---
-VERSION="v1.1.20"
+VERSION="v1.1.21"
 UPDATE_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/VERSION"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/mikeygnyc/k8s-pvc-shrink/refs/heads/main/kubectl-pvcshrink"
 TEMP_PVC_NAME="pvc-shrink-temp"
@@ -68,10 +68,72 @@ check_updates() {
 
 rollback() {
     echo -e "\n"
-    highlight "[CRITICAL] An error occurred. Attempting scale-up recovery..."
-    kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS" || true
-    msg "Workload scaled back. NOTE: '$TEMP_PVC_NAME' was NOT deleted to preserve data."
-    err "Manual intervention required. Check PVC '$PVC_NAME' vs '$TEMP_PVC_NAME'."
+    if [[ "$TYPE" == "cnpg" ]]; then
+        highlight "[CRITICAL] An error occurred. Attempting CNPG unfence recovery..."
+        if [[ "${CNPG_FENCED:-false}" == "true" ]]; then
+            cnpg_unfence || true
+        fi
+        msg "NOTE: '$TEMP_PVC_NAME' was NOT deleted to preserve data."
+        err "Manual intervention required. Check PVC '$PVC_NAME' vs '$TEMP_PVC_NAME'."
+    else
+        highlight "[CRITICAL] An error occurred. Attempting scale-up recovery..."
+        kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS" || true
+        msg "Workload scaled back. NOTE: '$TEMP_PVC_NAME' was NOT deleted to preserve data."
+        err "Manual intervention required. Check PVC '$PVC_NAME' vs '$TEMP_PVC_NAME'."
+    fi
+}
+
+cnpg_check_plugin() {
+    kubectl cnpg --help >/dev/null 2>&1 || err "kubectl cnpg plugin not found. Install it or use deployment/statefulset mode."
+}
+
+cnpg_check_clusters() {
+    local count
+    count=$(kubectl get clusters.postgresql.cnpg.io -A --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+    if [[ "$count" == "0" ]]; then
+        err "No CNPG clusters found in any namespace."
+    fi
+}
+
+cnpg_current_primary() {
+    kubectl get clusters.postgresql.cnpg.io "$CNPG_CLUSTER" -n "$NAMESPACE" -o json | yq -r '.status.currentPrimary // ""'
+}
+
+cnpg_promote() {
+    local target="$1"
+    msg "Promoting $target to primary..."
+    kubectl cnpg promote "$CNPG_CLUSTER" "$target" -n "$NAMESPACE"
+}
+
+cnpg_wait_for_primary() {
+    local target="$1"
+    local timeout=300
+    local start_time
+    start_time=$(date +%s)
+    while true; do
+        local current
+        current=$(cnpg_current_primary)
+        if [[ "$current" == "$target" ]]; then
+            msg "Primary is now $target."
+            break
+        fi
+        if (( $(date +%s) - start_time > timeout )); then
+            err "Timed out waiting for $target to become primary."
+        fi
+        sleep 3
+    done
+}
+
+cnpg_fence() {
+    msg "Fencing CNPG instance $CNPG_INSTANCE..."
+    kubectl cnpg fencing on "$CNPG_CLUSTER" "$CNPG_INSTANCE" -n "$NAMESPACE"
+    CNPG_FENCED=true
+}
+
+cnpg_unfence() {
+    msg "Unfencing CNPG instance $CNPG_INSTANCE..."
+    kubectl cnpg fencing off "$CNPG_CLUSTER" "$CNPG_INSTANCE" -n "$NAMESPACE"
+    CNPG_FENCED=false
 }
 
 sync_and_verify() {
@@ -159,24 +221,71 @@ done
 
 [[ "$SKIP_CHECK" = false ]] && check_updates "$@"
 
-TYPE=$(echo -e "deployment\nstatefulset" | fzf --header="Select Resource Type")
+MENU_ITEMS=()
+DEPLOY_COUNT=$(kubectl get deployments -A --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+STATEFULSET_COUNT=$(kubectl get statefulsets -A --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+CNPG_COUNT=$(kubectl get clusters.postgresql.cnpg.io -A --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+[[ "$DEPLOY_COUNT" != "0" ]] && MENU_ITEMS+=("deployment")
+[[ "$STATEFULSET_COUNT" != "0" ]] && MENU_ITEMS+=("statefulset")
+[[ "$CNPG_COUNT" != "0" ]] && MENU_ITEMS+=("cnpg")
+
+if [[ "${#MENU_ITEMS[@]}" -eq 0 ]]; then
+    err "No supported resource types found in the cluster."
+fi
+
+TYPE=$(printf "%s\n" "${MENU_ITEMS[@]}" | fzf --header="Select Resource Type")
 [[ -z "$TYPE" ]] && exit 0
 
-SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE")
-[[ -z "$SELECTED_RES" ]] && exit 0
+if [[ "$TYPE" == "cnpg" ]]; then
+    cnpg_check_clusters
+    cnpg_check_plugin
+    SELECTED_CLUSTER=$(kubectl get clusters.postgresql.cnpg.io -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select CNPG Cluster")
+    [[ -z "$SELECTED_CLUSTER" ]] && exit 0
+    NAMESPACE=$(echo "$SELECTED_CLUSTER" | awk '{print $1}')
+    CNPG_CLUSTER=$(echo "$SELECTED_CLUSTER" | awk '{print $2}')
 
-NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
-RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
+    CNPG_INSTANCE=$(kubectl get pods -n "$NAMESPACE" -l "cnpg.io/cluster=$CNPG_CLUSTER" -o custom-columns="NAME:.metadata.name" --no-headers | fzf --header="Select CNPG Instance")
+    [[ -z "$CNPG_INSTANCE" ]] && exit 0
 
-kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
+    CURRENT_PRIMARY=$(cnpg_current_primary)
+    [[ -z "$CURRENT_PRIMARY" ]] && err "Unable to determine current primary for cluster $CNPG_CLUSTER."
+    if [[ "$CNPG_INSTANCE" == "$CURRENT_PRIMARY" ]]; then
+        PROMOTE_TARGET=$(kubectl get pods -n "$NAMESPACE" -l "cnpg.io/cluster=$CNPG_CLUSTER" -o custom-columns="NAME:.metadata.name" --no-headers | grep -v "^$CNPG_INSTANCE$" | fzf --header="Select instance to promote to primary")
+        [[ -z "$PROMOTE_TARGET" ]] && exit 0
+        cnpg_promote "$PROMOTE_TARGET"
+        cnpg_wait_for_primary "$PROMOTE_TARGET"
+    fi
 
-PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
-[[ -z "$PVC_NAME" ]] && exit 0
+    kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
+
+    PVC_NAME=$(kubectl get pod "$CNPG_INSTANCE" -n "$NAMESPACE" -o json | yq -r '.spec.volumes[] | select(.persistentVolumeClaim.claimName != null) | .persistentVolumeClaim.claimName' | fzf --header="Select PVC")
+    [[ -z "$PVC_NAME" ]] && exit 0
+else
+    SELECTED_RES=$(kubectl get "$TYPE" -A -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" --no-headers | fzf --header="Select $TYPE")
+    [[ -z "$SELECTED_RES" ]] && exit 0
+
+    NAMESPACE=$(echo "$SELECTED_RES" | awk '{print $1}')
+    RES_NAME=$(echo "$SELECTED_RES" | awk '{print $2}')
+
+    kubectl delete pod shrink-to-temp shrink-back -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1
+
+    PVC_NAME=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.volumes[*].persistentVolumeClaim.claimName}' | tr ' ' '\n' | fzf --header="Select PVC")
+    [[ -z "$PVC_NAME" ]] && exit 0
+fi
 
 CURRENT_SIZE=$(kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.resources.requests.storage}')
 CURRENT_UNIT=${CURRENT_SIZE//[0-9.]/}
 
-ACTIVE_POD=$(kubectl get pods -n "$NAMESPACE" --field-selector=status.phase=Running -o json | yq ".items[] | select(.spec.volumes[].persistentVolumeClaim.claimName == \"$PVC_NAME\") | .metadata.name" | head -n 1)
+if [[ "$TYPE" == "cnpg" ]]; then
+    POD_PHASE=$(kubectl get pod "$CNPG_INSTANCE" -n "$NAMESPACE" -o jsonpath='{.status.phase}')
+    if [[ "$POD_PHASE" == "Running" ]]; then
+        ACTIVE_POD="$CNPG_INSTANCE"
+    else
+        ACTIVE_POD=""
+    fi
+else
+    ACTIVE_POD=$(kubectl get pods -n "$NAMESPACE" --field-selector=status.phase=Running -o json | yq ".items[] | select(.spec.volumes[].persistentVolumeClaim.claimName == \"$PVC_NAME\") | .metadata.name" | head -n 1)
+fi
 
 if [[ -n "$ACTIVE_POD" ]]; then
     # Fixed: Using yq to find the mount path to avoid kubectl jsonpath filter bugs
@@ -222,12 +331,16 @@ if [[ "$DRY_RUN" = true ]]; then
     exit 0
 fi
 
-ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
 trap rollback ERR
 
-msg "Scaling down $TYPE/$RES_NAME..."
-kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
-kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=120s || true
+if [[ "$TYPE" == "cnpg" ]]; then
+    cnpg_fence
+else
+    ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
+    msg "Scaling down $TYPE/$RES_NAME..."
+    kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas=0
+    kubectl wait --for=delete pod -l "app.kubernetes.io/name=$RES_NAME" -n "$NAMESPACE" --timeout=120s || true
+fi
 
 msg "Creating staging PVC..."
 kubectl get pvc "$PVC_NAME" -n "$NAMESPACE" -o yaml | yq '.metadata.name = "'"$TEMP_PVC_NAME"'" | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.annotations["pv.kubernetes.io/bind-completed"], .metadata.annotations["pv.kubernetes.io/bound-by-controller"], .spec.volumeName)' | kubectl apply -f -
@@ -243,14 +356,20 @@ kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/"$PVC_NAME" -n "$NAMESPA
 sync_and_verify "$TEMP_PVC_NAME" "$PVC_NAME" "shrink-back"
 
 trap - ERR
-msg "Restoring workload..."
-kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
-kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE" --timeout=300s
+if [[ "$TYPE" == "cnpg" ]]; then
+    cnpg_unfence
+    msg "Verifying CNPG instance readiness..."
+    kubectl wait --for=condition=Ready "pod/$CNPG_INSTANCE" -n "$NAMESPACE" --timeout=300s || true
+else
+    msg "Restoring workload..."
+    kubectl scale "$TYPE" "$RES_NAME" -n "$NAMESPACE" --replicas="$ORIG_REPLICAS"
+    kubectl rollout status "$TYPE/$RES_NAME" -n "$NAMESPACE" --timeout=300s
 
-msg "Verifying Pod Readiness..."
-sleep 2
-kubectl wait --for=condition=Ready pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$RES_NAME" --timeout=300s || \
-kubectl wait --for=condition=Ready pods -n "$NAMESPACE" -l "app=$RES_NAME" --timeout=300s || true
+    msg "Verifying Pod Readiness..."
+    sleep 2
+    kubectl wait --for=condition=Ready pods -n "$NAMESPACE" -l "app.kubernetes.io/name=$RES_NAME" --timeout=300s || \
+    kubectl wait --for=condition=Ready pods -n "$NAMESPACE" -l "app=$RES_NAME" --timeout=300s || true
+fi
 
 msg "Shrink Complete. Cleaning up temporary volume..."
 kubectl delete pvc "$TEMP_PVC_NAME" -n "$NAMESPACE"
