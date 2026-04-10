@@ -137,7 +137,7 @@ cnpg_fence() {
 cnpg_unfence() {
     CNPG_INSTANCE_INDEX="${CNPG_INSTANCE##*-}"
     msg "Unfencing CNPG instance $CNPG_INSTANCE (index $CNPG_INSTANCE_INDEX)..."
-    kubectl cnpg fencing off "$CNPG_CLUSTER" "$CNPG_INSTANCE_INDEX" -n "$NAMESPACE"
+    kubectl cnpg fencing off "$CNPG_CLUSTER" '"*"' -n "$NAMESPACE"
     CNPG_FENCED=false
 }
 
