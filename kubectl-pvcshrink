@@ -353,6 +353,8 @@ trap rollback ERR
 
 if [[ "$TYPE" == "cnpg" ]]; then
     cnpg_fence
+    msg "Deleting CNPG instance pod $CNPG_INSTANCE..."
+    kubectl delete pod "$CNPG_INSTANCE" -n "$NAMESPACE" --wait=true
 else
     ORIG_REPLICAS=$(kubectl get "$TYPE" "$RES_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
     msg "Scaling down $TYPE/$RES_NAME..."
@@ -369,8 +371,6 @@ sync_and_verify "$PVC_NAME" "$TEMP_PVC_NAME" "shrink-to-temp"
 msg "Recreating original PVC at $NEW_SIZE..."
 if [[ "$TYPE" == "cnpg" ]]; then
     cnpg_pause_reconciliation
-    msg "Deleting CNPG instance pod $CNPG_INSTANCE..."
-    kubectl delete pod "$CNPG_INSTANCE" -n "$NAMESPACE" --wait=true
     kubectl delete pvc "$PVC_NAME" -n "$NAMESPACE" --wait=true
 else
     kubectl delete pvc "$PVC_NAME" -n "$NAMESPACE" --wait=true
