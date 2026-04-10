@@ -128,14 +128,16 @@ cnpg_wait_for_primary() {
 }
 
 cnpg_fence() {
-    msg "Fencing CNPG instance $CNPG_INSTANCE..."
-    kubectl cnpg fencing on "$CNPG_CLUSTER" "$CNPG_INSTANCE" -n "$NAMESPACE"
+    CNPG_INSTANCE_INDEX="${CNPG_INSTANCE##*-}"
+    msg "Fencing CNPG instance $CNPG_INSTANCE (index $CNPG_INSTANCE_INDEX)..."
+    kubectl cnpg fencing on "$CNPG_CLUSTER" "$CNPG_INSTANCE_INDEX" -n "$NAMESPACE"
     CNPG_FENCED=true
 }
 
 cnpg_unfence() {
-    msg "Unfencing CNPG instance $CNPG_INSTANCE..."
-    kubectl cnpg fencing off "$CNPG_CLUSTER" "$CNPG_INSTANCE" -n "$NAMESPACE"
+    CNPG_INSTANCE_INDEX="${CNPG_INSTANCE##*-}"
+    msg "Unfencing CNPG instance $CNPG_INSTANCE (index $CNPG_INSTANCE_INDEX)..."
+    kubectl cnpg fencing off "$CNPG_CLUSTER" "$CNPG_INSTANCE_INDEX" -n "$NAMESPACE"
     CNPG_FENCED=false
 }
 
